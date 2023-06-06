@@ -1,0 +1,10 @@
+{
+  "changes": [
+    {
+      "packageName": "@rushstack/heft-web-rig",
+      "comment": "Fix a regression where Jest 29 was choosing the non-CommonJS entry point when resolving NPM packages",
+      "type": "patch"
+    }
+  ],
+  "packageName": "@rushstack/heft-web-rig"
+}
