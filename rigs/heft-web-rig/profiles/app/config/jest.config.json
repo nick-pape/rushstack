@@ -3,6 +3,20 @@
 
   "testEnvironment": "jest-environment-jsdom",
 
+  "testEnvironmentOptions": {
+    // heft-web-rig writes ESM output (with "import" statements") into the "lib" folder
+    // to be processed by Webpack.
+    // heft-web-rig writes CommonJS output (with "require()" calls") into the "lib-commonjs" folder
+    // to be processed by Jest.  We do this because the Node.js/Jest have trouble handling legacy
+    // CommonJS-only packages, whereas Webpack easily handles mixed module types.
+    //
+    // The jest-environment-jsdom package now sets "customExportConditions" to ["browser"],
+    // which forces Jest to choose the ESM entry point when resolving packages. This is incorrect for
+    // our setup.  The setting below fixes that.  For details, refer to these docs:
+    // https://nodejs.org/api/packages.html#conditional-exports
+    "customExportConditions": ["require", "node", "umd"]
+  },
+
   // "Adding '<rootDir>/lib-commonjs' here enables lib-commonjs/__mocks__ to be used for mocking Node.js system modules
   "roots": ["<rootDir>/lib-commonjs"],
 
