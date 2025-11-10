@@ -805,20 +805,20 @@ export class SassProcessor {
         const { folder, shimModuleFormat } = cssOutputFolder;
 
         const cssFilePath: string = path.resolve(folder, relativeCssPath);
-        
+
         // Add sourceMappingURL comment if source map is enabled
         let cssWithSourceMap: string = css;
         if (result.sourceMap && this._options.sourceMap) {
           const sourceMapFilename: string = `${path.basename(relativeCssPath)}.map`;
           cssWithSourceMap = `${css}\n/*# sourceMappingURL=${sourceMapFilename} */`;
         }
-        
+
         await FileSystem.writeFileAsync(cssFilePath, cssWithSourceMap, writeFileOptions);
 
         // Write source map file if enabled
         if (result.sourceMap && this._options.sourceMap) {
           const sourceMapPath: string = `${cssFilePath}.map`;
-          await FileSystem.writeFileAsync(sourceMapPath, result.sourceMap, writeFileOptions);
+          await FileSystem.writeFileAsync(sourceMapPath, JSON.stringify(result.sourceMap), writeFileOptions);
         }
 
         if (shimModuleFormat && !filename.endsWith('.css')) {
