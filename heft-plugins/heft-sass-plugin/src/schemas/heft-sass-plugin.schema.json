@@ -106,6 +106,16 @@
       "items": {
         "type": "string"
       }
+    },
+
+    "sourceMap": {
+      "type": "boolean",
+      "description": "If true, Sass will generate source maps for the compiled CSS files. Source maps will be written to files with a .css.map extension alongside the CSS output files."
+    },
+
+    "sourceMapIncludeSources": {
+      "type": "boolean",
+      "description": "If true (and sourceMap is also true), the original SCSS source code will be embedded in the source map. This is useful for debugging but increases source map file size."
     }
   }
 }

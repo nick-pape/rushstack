@@ -118,6 +118,16 @@ export interface ISassProcessorOptions {
    * A callback to further modify the raw CSS text after it has been generated. Only relevant if emitting CSS files.
    */
   postProcessCssAsync?: (cssText: string) => Promise<string>;
+
+  /**
+   * If true, Sass will generate source maps for the compiled CSS files.
+   */
+  sourceMap?: boolean;
+
+  /**
+   * If true (and sourceMap is also true), the original SCSS source code will be embedded in the source map.
+   */
+  sourceMapIncludeSources?: boolean;
 }
 
 /**
@@ -245,7 +255,9 @@ export class SassProcessor {
           load: loadAsync
         }
       ],
-      silenceDeprecations: deprecationsToSilence
+      silenceDeprecations: deprecationsToSilence,
+      sourceMap: options.sourceMap,
+      sourceMapIncludeSources: options.sourceMapIncludeSources
     };
   }
 
@@ -793,7 +805,21 @@ export class SassProcessor {
         const { folder, shimModuleFormat } = cssOutputFolder;
 
         const cssFilePath: string = path.resolve(folder, relativeCssPath);
-        await FileSystem.writeFileAsync(cssFilePath, css, writeFileOptions);
+        
+        // Add sourceMappingURL comment if source map is enabled
+        let cssWithSourceMap: string = css;
+        if (result.sourceMap && this._options.sourceMap) {
+          const sourceMapFilename: string = `${path.basename(relativeCssPath)}.map`;
+          cssWithSourceMap = `${css}\n/*# sourceMappingURL=${sourceMapFilename} */`;
+        }
+        
+        await FileSystem.writeFileAsync(cssFilePath, cssWithSourceMap, writeFileOptions);
+
+        // Write source map file if enabled
+        if (result.sourceMap && this._options.sourceMap) {
+          const sourceMapPath: string = `${cssFilePath}.map`;
+          await FileSystem.writeFileAsync(sourceMapPath, result.sourceMap, writeFileOptions);
+        }
 
         if (shimModuleFormat && !filename.endsWith('.css')) {
           const jsFilePath: string = path.resolve(folder, `${relativeFilePath}.js`);
