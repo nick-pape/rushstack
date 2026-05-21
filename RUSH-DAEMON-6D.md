@@ -87,3 +87,34 @@ Validation gate (each step): rush-lib `heft test` 627/0 + local-rush regression
 (`rush build`, `rush start --watch`, and — for 6d-3 — `rush daemon` + socket: in-process install while
 watching, verify the watch resumes and the lock was never released). NOTE: `@microsoft/rush-lib` is
 published → a real PR needs a `rush change` entry.
+
+## 6d-2 / 6d-3 — DONE & validated (in-process commands under the held lock)
+
+Implemented as an experimental, env-gated (`RUSHMCP_DAEMON_SOCKET`) control channel on the watch
+(commits `f4f6fa69e4`, `355d47739d`) rather than a separate `rush daemon` action, to avoid the
+command-registration detour and reuse all existing `rush start` config. To be promoted to a first-class
+`RushDaemonAction` for upstream.
+
+- `DaemonControlServer` (unix socket, JSON-line protocol): `status`, `check` (read-only, no quiesce),
+  and `install` (mutating).
+- `PhasedCommandRunner.runExclusiveAsync(fn)`: pause the ProjectWatcher, abort + await the in-flight
+  build, run the `shutdownAsync` hook (stop IPC child procs), run `fn`, resume the watcher. Relies on
+  `waitForChangeAsync` parking while paused (verified in ProjectWatcher) so no build runs during `fn`.
+- `install` calls `doBasicInstallAsync` in-process via `runExclusiveAsync` — the watch process already
+  holds the `'rush'` lock, so it does NOT re-acquire it.
+
+**Validated (local rush, `rush start` + socket):** `status` → `{watching:true,pid}`; `check` ran
+in-process; `install` ran in-process WHILE watching (`ok=true`, "Install completed."), the daemon log
+showed `[PAUSED] → install → [WATCHING] resuming` with NO "Another Rush command is already running",
+and the watch then detected a new change and rebuilt. rush-lib `heft test` 627/0 throughout.
+
+**Finding:** `doBasicInstallAsync` runs the git-email policy internally (not just the action layer), so
+the first in-process install aborted until a git identity was set (`git config --local user.email ...`).
+Real users have this; the daemon may want to pass `bypassPolicy` or surface the policy error cleanly.
+
+## Remaining
+- update/add commands (update needs `allowShrinkwrapUpdates:true` — a different manager call than
+  `doBasicInstallAsync`); request queue so concurrent agents serialize.
+- Promote the env-gated prototype to a first-class `RushDaemonAction` (registration).
+- 6d-4: point the MCP `BuildHostDaemon` at this control socket (run mutating commands in-process via
+  the daemon instead of stop-daemon→install→restart).
