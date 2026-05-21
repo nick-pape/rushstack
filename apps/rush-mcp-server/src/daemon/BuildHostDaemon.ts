@@ -42,6 +42,7 @@ export interface IBuildHostDaemonOptions {
  */
 export class BuildHostDaemon {
   private readonly _options: IBuildHostDaemonOptions;
+  private _controlSocketPath: string | undefined;
 
   public constructor(options: IBuildHostDaemonOptions) {
     this._options = options;
@@ -50,6 +51,8 @@ export class BuildHostDaemon {
   public async runAsync(): Promise<void> {
     const { workspacePath } = this._options;
     const commonTempFolder: string = path.join(workspacePath, 'common', 'temp');
+    // The watch will open its in-process control channel here (rush-lib reads RUSHMCP_DAEMON_SOCKET).
+    this._controlSocketPath = path.join(commonTempFolder, 'rushmcp-build-host-control.sock');
 
     // Only one daemon per repo.
     const lock: LockFile | undefined = LockFile.tryAcquire(commonTempFolder, 'rushmcp-daemon');
@@ -96,7 +99,8 @@ export class BuildHostDaemon {
         writeDiscovery(workspacePath, {
           webSocketUrl,
           daemonPid: process.pid,
-          startedAt: new Date().toISOString()
+          startedAt: new Date().toISOString(),
+          controlSocketPath: this._controlSocketPath
         });
         process.stdout.write(`Build host ready at ${webSocketUrl} (daemon pid ${process.pid}).\n`);
 
@@ -132,6 +136,12 @@ export class BuildHostDaemon {
       if (key.startsWith('RUSHMCP_')) {
         delete childEnv[key];
       }
+    }
+    // ...except RUSHMCP_DAEMON_SOCKET, which tells the watch where to open its in-process control
+    // channel. rush-lib reads (and does not reject) this variable.
+    if (this._controlSocketPath) {
+      // eslint-disable-next-line dot-notation
+      childEnv['RUSHMCP_DAEMON_SOCKET'] = this._controlSocketPath;
     }
 
     return spawn(resolved, startArgs, {

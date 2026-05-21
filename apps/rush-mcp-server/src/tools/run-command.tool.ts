@@ -23,6 +23,9 @@ const ALLOWED_COMMANDS: readonly ['check', 'list', 'install', 'update', 'add', '
 
 const MUTATING_COMMANDS: ReadonlySet<string> = new Set(['install', 'update', 'add', 'remove']);
 
+/** Mutating commands the daemon's in-process control channel can run (vs. the stop-daemon fallback). */
+const DAEMON_INPROCESS_COMMANDS: ReadonlySet<string> = new Set(['install']);
+
 const MAX_OUTPUT_LINES: number = 1000;
 
 interface IRushRunCommandArgs {
@@ -80,6 +83,21 @@ export class RushRunCommandTool extends BaseTool {
 
     let notice: string = '';
     if (MUTATING_COMMANDS.has(command)) {
+      // Preferred path: if the running daemon's watch exposes an in-process control channel and supports
+      // this command, run it inside the watch under the lock it already holds (no teardown, watch stays
+      // warm). Falls back to stopping the daemon and shelling out otherwise.
+      if (DAEMON_INPROCESS_COMMANDS.has(command) && this._client.getControlSocketPath()) {
+        const inProcess: { ok: boolean; text: string } = await this._client.sendDaemonCommandAsync(
+          command,
+          args
+        );
+        return this._textResult(
+          `Ran "rush ${command}" in-process in the build host (watch kept warm, lock never released).\n\n` +
+            inProcess.text,
+          !inProcess.ok
+        );
+      }
+
       const stopped: boolean = await this._client.stopDaemonAsync();
       if (stopped) {
         notice =

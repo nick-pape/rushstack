@@ -6,6 +6,7 @@ import type { ClientRequest, IncomingMessage } from 'node:http';
 import { spawn, type ChildProcess } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import * as net from 'node:net';
 
 import { WebSocket, type RawData } from 'ws';
 
@@ -34,6 +35,8 @@ const CONNECT_TIMEOUT_MS: number = 15000;
 const DEFAULT_START_TIMEOUT_MS: number = 180000;
 const DISCOVERY_POLL_MS: number = 250;
 const STOP_TIMEOUT_MS: number = 10000;
+// Mutating commands (install/update) can take a while; allow generous time for an in-process command.
+const DAEMON_COMMAND_TIMEOUT_MS: number = 600000;
 
 function delayAsync(milliseconds: number): Promise<void> {
   return new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
@@ -246,6 +249,71 @@ export class RushServeClient {
       // ignore
     }
     return true;
+  }
+
+  /**
+   * Returns the path of the watch's in-process control socket, if the running daemon advertises one.
+   */
+  public getControlSocketPath(): string | undefined {
+    return readDiscovery(this._workspacePath)?.controlSocketPath;
+  }
+
+  /**
+   * Sends a command to the watch's in-process control channel (e.g. an `install` that runs inside the
+   * watch under the held lock) and returns its result. Throws if no control socket is available.
+   */
+  public async sendDaemonCommandAsync(
+    command: string,
+    args: string[] = []
+  ): Promise<{ ok: boolean; text: string }> {
+    const socketPath: string | undefined = this.getControlSocketPath();
+    if (!socketPath) {
+      throw new Error(
+        'No build-host control socket is available (the watch was not started with in-process command support).'
+      );
+    }
+    return await new Promise<{ ok: boolean; text: string }>((resolve, reject) => {
+      const socket: net.Socket = net.connect(socketPath);
+      let buffer: string = '';
+      let settled: boolean = false;
+      const timeout: NodeJS.Timeout = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          socket.destroy();
+          reject(new Error('Timed out waiting for the daemon control response.'));
+        }
+      }, DAEMON_COMMAND_TIMEOUT_MS);
+
+      socket.setEncoding('utf8');
+      socket.on('connect', () => {
+        socket.write(JSON.stringify({ id: 1, command, args }) + '\n');
+      });
+      socket.on('data', (chunk: string) => {
+        buffer += chunk;
+        const newlineIndex: number = buffer.indexOf('\n');
+        if (newlineIndex >= 0 && !settled) {
+          settled = true;
+          clearTimeout(timeout);
+          let response: { ok?: boolean; text?: string };
+          try {
+            response = JSON.parse(buffer.slice(0, newlineIndex));
+          } catch {
+            socket.end();
+            reject(new Error('Malformed daemon control response.'));
+            return;
+          }
+          socket.end();
+          resolve({ ok: !!response.ok, text: String(response.text ?? '') });
+        }
+      });
+      socket.on('error', (error: Error) => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timeout);
+          reject(new Error(`Could not reach the daemon control socket: ${error.message}`));
+        }
+      });
+    });
   }
 
   /**

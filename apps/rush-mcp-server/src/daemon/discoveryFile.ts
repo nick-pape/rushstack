@@ -16,6 +16,12 @@ export interface IBuildHostDiscovery {
   daemonPid: number;
   /** ISO timestamp of when the daemon started serving. */
   startedAt: string;
+  /**
+   * The unix socket path of the watch's in-process control channel, if the watch was started with one
+   * (rush-lib `RUSHMCP_DAEMON_SOCKET`). When present, mutating commands can run in-process in the watch
+   * instead of stopping the daemon.
+   */
+  controlSocketPath?: string;
 }
 
 const DISCOVERY_RELATIVE_PATH: string = 'common/temp/rushmcp-build-host.json';
