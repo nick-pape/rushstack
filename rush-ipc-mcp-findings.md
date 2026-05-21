@@ -109,7 +109,7 @@ call these directly in-process without re-acquiring.
 - **Phase 2** — control the watch (rebuild / set-watch-state / abort). ✅ **done, validated live**
 - **Phase 3** — read-only rush commands (check/list) via shell-out. ✅ **done, validated via shim**
 - **Phase 4** — spawn-or-connect (stop requiring a pre-started watch). ✅ **done, validated via shim**
-- **Phase 5** — mutating rush commands (the Path-1 stop-the-world dance).
+- **Phase 5** — mutating rush commands (the Path-1 stop-the-world dance). ✅ **done, validated via shim**
 - **Phase 6** — multi-agent sharing + robustness (discovery file, race-safe spawn) → Path-2 decision.
 
 ## 7. Implementation status
@@ -126,9 +126,11 @@ noreply email during the first push — see Validation log).
 - `rush_rebuild` — invalidate a project's operations (force rebuild).
 - `rush_set_watch_state` — set enabled state (never|changed|affected|default) per project/phase.
 - `rush_abort_build` — abort the current execution pass.
-- `rush_run_command` — run a read-only Rush command (allowlist: `check`, `list`) via shell-out;
-  allowlist enforced in BOTH the input schema and the handler. Uses
-  `CommandRunner.runRushCommandCaptureAsync` (resolves with output regardless of exit code).
+- `rush_run_command` — run an allowed Rush command via shell-out (allowlist enforced in BOTH the
+  schema and the handler; uses `CommandRunner.runRushCommandCaptureAsync`, output regardless of exit
+  code). Read-only (`check`, `list`) run directly. **Mutating** (`install`, `update`, `add`, `remove`)
+  need the repo lock: if we started the watch, it is stopped first (restarts lazily on next build
+  query); if a watch we did NOT start is connected, the command is refused.
 
 **File inventory:**
 - `apps/rush-mcp-server/src/buildHost/protocol.types.ts` — local mirror of rush-serve `/api` (events + commands).
@@ -194,6 +196,11 @@ noreply email during the first push — see Validation log).
   Stray-process cleanup during testing, BY PID (do NOT `pkill -f` patterns that also match your own
   shell — that kills the build): `for p in $(ps -eo pid,args | grep 'rush start' | grep -v grep |
   awk '{print $1}'); do kill -9 $p; done` and `rm -f common/temp/rush#*.lock`.
+- **Phase 5 live (via shim):** `rush_run_command` read-only `list` ran directly (exit 0); a mutating
+  `install` while our watch was running stopped the watch (freeing the lock), ran `rush install`
+  (exit 0), and left no orphan — `isHostSpawnedByUs` went true→false. The external-watch refusal branch
+  (`isConnected && !isHostSpawnedByUs`) is trivial logic and was not stood up as a separate e2e.
+  Note: `rush install` needs `--bypass-policy` in this repo (git-email policy); real users won't.
 
 ## 9. Running the live test harness (repro)
 
