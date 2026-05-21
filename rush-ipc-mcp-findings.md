@@ -113,8 +113,16 @@ call these directly in-process without re-acquiring.
 - **Phase 6 / Path 2 (chosen)** — `rush daemon`: a persistent supervisor owns one shared watch; see §11.
   - 6a — daemon foundation (supervisor + discovery + graceful shutdown). ✅ **done, validated standalone**
   - 6b — wire the MCP client to start-or-connect to the daemon (+ shutdown tool). ✅ **done, validated**
-  - 6c — daemon-mediated mutating commands + supervision/auto-restart.
+  - 6c — auto-restart supervision. ✅ **done, validated**. (Daemon-*mediated* mutating via a control
+    socket: intentionally NOT built — see note below; the current "stop the daemon, run, lazy restart"
+    is correct and composes with supervision, and proper mediation belongs in 6d.)
   - 6d — upstream `rush daemon` in rush-lib with in-process managers (no child `rush start`).
+
+**Why mutating kills the whole daemon (not just its watch):** with supervision, if a client killed only
+the watch to free the lock, the daemon would immediately restart the watch and fight the in-flight
+`install` for the lock. Killing the daemon removes the supervisor cleanly so nothing races the install;
+a fresh daemon starts lazily afterward. Daemon-*mediated* install (daemon pauses supervision → runs →
+resumes) needs a control channel and is the right shape for 6d, not a bespoke socket now.
 
 ## 7. Implementation status
 
@@ -217,6 +225,11 @@ noreply email during the first push — see Validation log).
   lazily). `rush_shutdown_host` stopped the daemon (dead, discovery cleared). Client model changed:
   the client no longer owns the watch (the daemon does); `disposeAsync` is a no-op so the shared host
   survives MCP exits; mutating commands stop the daemon (any client can) rather than refusing.
+- **Phase 6c live (supervision, via shim):** with the daemon serving at port 45731, killed its watch
+  process group to simulate a crash. The daemon logged `Watch exited; restarting...` and came back at a
+  NEW port (34529), same daemon pid, discovery file updated. A client then connected to the restarted
+  watch via discovery (`POST-RESTART: Overall status: Success`). `SIGTERM` → clean shutdown, no orphans.
+  Crash-loop guard: gives up after `MAX_CONSECUTIVE_FAILURES` fast failures.
 
 ## 9. Running the live test harness (repro)
 
