@@ -9,6 +9,7 @@ import { WebSocket, type RawData } from 'ws';
 import type {
   IOperationInfo,
   IRushSessionInfo,
+  IWebSocketCommandMessage,
   IWebSocketEventMessage,
   ReadableOperationStatus
 } from './protocol.types';
@@ -110,6 +111,32 @@ export class RushServeClient {
       sessionInfo: this._sessionInfo,
       operations: Array.from(this._operationsByName.values())
     };
+  }
+
+  /**
+   * Returns the operations in the current snapshot that match the given project and/or phase.
+   */
+  public findOperations(filter: { project?: string; phase?: string }): IOperationInfo[] {
+    let operations: IOperationInfo[] = Array.from(this._operationsByName.values());
+    if (filter.project !== undefined) {
+      operations = operations.filter((operation) => operation.packageName === filter.project);
+    }
+    if (filter.phase !== undefined) {
+      operations = operations.filter((operation) => operation.phaseName === filter.phase);
+    }
+    return operations;
+  }
+
+  /**
+   * Sends a command to the build host. Commands are fire-and-forget; their effect is observed via
+   * subsequent status events.
+   */
+  public async sendCommandAsync(message: IWebSocketCommandMessage): Promise<void> {
+    await this.ensureReadyAsync();
+    if (!this._webSocket || this._webSocket.readyState !== WebSocket.OPEN) {
+      throw new Error('Not connected to the Rush build host.');
+    }
+    this._webSocket.send(JSON.stringify(message));
   }
 
   /**

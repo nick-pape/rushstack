@@ -107,3 +107,44 @@ export type IWebSocketEventMessage =
   | IWebSocketAfterExecuteEventMessage
   | IWebSocketBatchStatusChangeEventMessage
   | IWebSocketSyncEventMessage;
+
+/**
+ * The set of possible enabled states for an operation, used by the "set-enabled-states" command.
+ *
+ * - `never`: never build this operation
+ * - `changed`: build only when its own project has directly changed
+ * - `affected`: always build when reached (changed or downstream of a change)
+ * - `default`: restore the command's original behavior
+ */
+export type OperationEnabledState = 'never' | 'changed' | 'affected' | 'default';
+
+/** Asks the build host to resend a full `sync` snapshot. */
+export interface IWebSocketSyncCommandMessage {
+  command: 'sync';
+}
+
+/** Asks the build host to abort the current execution pass. */
+export interface IWebSocketAbortExecutionCommandMessage {
+  command: 'abort-execution';
+}
+
+/** Asks the build host to invalidate (and thus rebuild) the named operations. */
+export interface IWebSocketInvalidateCommandMessage {
+  command: 'invalidate';
+  operationNames: string[];
+}
+
+/** Asks the build host to change the enabled state of the named operations. */
+export interface IWebSocketSetEnabledStatesCommandMessage {
+  command: 'set-enabled-states';
+  enabledStateByOperationName: Record<string, OperationEnabledState>;
+}
+
+/**
+ * The set of possible messages sent from a client to the build host.
+ */
+export type IWebSocketCommandMessage =
+  | IWebSocketSyncCommandMessage
+  | IWebSocketAbortExecutionCommandMessage
+  | IWebSocketInvalidateCommandMessage
+  | IWebSocketSetEnabledStatesCommandMessage;

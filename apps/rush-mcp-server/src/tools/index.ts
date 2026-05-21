@@ -9,3 +9,6 @@ export { RushWorkspaceDetailsTool } from './workspace-details';
 export { RushConflictResolverTool } from './conflict-resolver.tool';
 export { RushBuildStatusTool } from './build-status.tool';
 export { RushBuildLogsTool } from './build-logs.tool';
+export { RushRebuildTool } from './build-rebuild.tool';
+export { RushSetWatchStateTool } from './build-watch-state.tool';
+export { RushAbortBuildTool } from './build-abort.tool';
