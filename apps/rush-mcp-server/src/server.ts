@@ -34,7 +34,7 @@ export class RushMCPServer extends McpServer {
 
     this._rushWorkspacePath = rushWorkspacePath;
     this._pluginLoader = new RushMcpPluginLoader(this._rushWorkspacePath, this);
-    this._buildHostClient = new RushServeClient(getBuildHostConfigFromEnv());
+    this._buildHostClient = new RushServeClient(getBuildHostConfigFromEnv(this._rushWorkspacePath));
   }
 
   public async startAsync(): Promise<void> {
