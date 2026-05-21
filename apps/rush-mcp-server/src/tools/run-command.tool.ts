@@ -3,15 +3,25 @@
 
 import { z } from 'zod';
 
+import type { RushServeClient } from '../buildHost/RushServeClient';
 import { CommandRunner, type ICommandResult } from '../utilities/command-runner';
 import { BaseTool, type CallToolResult } from './base.tool';
 
 /**
- * The Rush commands this tool is allowed to run. Restricted to read-only commands that set
- * `safeForSimultaneousRushProcesses` (they skip the repo lock), so they are safe to run alongside a
- * live `rush start` watch. Mutating commands (install/update/add/remove) are intentionally excluded.
+ * The Rush commands this tool is allowed to run. Read-only commands set
+ * `safeForSimultaneousRushProcesses` (they skip the repo lock) and run directly. Mutating commands
+ * acquire the repo lock and rewrite `node_modules`, so they are coordinated with a running watch.
  */
-const ALLOWED_COMMANDS: readonly ['check', 'list'] = ['check', 'list'];
+const ALLOWED_COMMANDS: readonly ['check', 'list', 'install', 'update', 'add', 'remove'] = [
+  'check',
+  'list',
+  'install',
+  'update',
+  'add',
+  'remove'
+];
+
+const MUTATING_COMMANDS: ReadonlySet<string> = new Set(['install', 'update', 'add', 'remove']);
 
 const MAX_OUTPUT_LINES: number = 1000;
 
@@ -31,43 +41,57 @@ function trimOutput(text: string): string {
 }
 
 /**
- * Runs a read-only Rush command in the workspace via the `rush` CLI. Safe to use while a watch is
- * running because the allowed commands do not acquire the repository lock.
+ * Runs an allowed Rush command in the workspace via the `rush` CLI. Read-only commands (`check`,
+ * `list`) are safe alongside a running watch. Mutating commands (`install`, `update`, `add`, `remove`)
+ * need the repository lock, so a watch this server started is stopped first (and restarts on the next
+ * build query); a watch this server did not start causes the command to be refused.
  */
 export class RushRunCommandTool extends BaseTool {
-  public constructor() {
+  private readonly _client: RushServeClient;
+
+  public constructor(client: RushServeClient) {
     super({
       name: 'rush_run_command',
       description:
-        `Runs a read-only Rush command (one of: ${ALLOWED_COMMANDS.join(', ')}) in the workspace and ` +
-        'returns its output. These commands are safe to run alongside a running "rush start" watch ' +
-        'because they do not take the repository lock. Mutating commands (install, update, add, remove) ' +
-        'are not supported by this tool.',
+        `Runs an allowed Rush command (${ALLOWED_COMMANDS.join(', ')}) in the workspace and returns ` +
+        'its output. Read-only commands (check, list) are safe alongside a running watch. Mutating ' +
+        'commands (install, update, add, remove) need the repository lock: if this server started a ' +
+        'watch it is stopped first (and restarts on the next build-status query); if a watch this ' +
+        'server did not start is running, the command is refused so it cannot conflict.',
       schema: {
-        command: z
-          .enum(ALLOWED_COMMANDS)
-          .describe('The Rush command to run. Only read-only commands are allowed.'),
+        command: z.enum(ALLOWED_COMMANDS).describe('The Rush command to run.'),
         args: z
           .array(z.string())
           .optional()
-          .describe('Additional command-line arguments to pass (e.g. ["--json"]).')
+          .describe('Additional command-line arguments to pass (e.g. ["--to", "my-project"]).')
       }
     });
+    this._client = client;
   }
 
   public async executeAsync({ command, args = [] }: IRushRunCommandArgs): Promise<CallToolResult> {
-    // Defense-in-depth: enforce the allowlist in the handler, not only via the input schema, so the
-    // tool never runs an arbitrary (e.g. mutating) Rush command even if invoked outside the schema.
+    // Defense-in-depth: enforce the allowlist in the handler, not only via the input schema.
     if (!(ALLOWED_COMMANDS as readonly string[]).includes(command)) {
-      return {
-        isError: true,
-        content: [
-          {
-            type: 'text',
-            text: `Command "${command}" is not allowed. Allowed read-only commands: ${ALLOWED_COMMANDS.join(', ')}.`
-          }
-        ]
-      };
+      return this._textResult(
+        `Command "${command}" is not allowed. Allowed commands: ${ALLOWED_COMMANDS.join(', ')}.`,
+        true
+      );
+    }
+
+    let notice: string = '';
+    if (MUTATING_COMMANDS.has(command)) {
+      if (this._client.isHostSpawnedByUs()) {
+        await this._client.stopSpawnedHostAsync();
+        notice =
+          'Stopped the build host this server started to free the repository lock; it will restart ' +
+          'on the next build-status query.\n\n';
+      } else if (this._client.isConnected()) {
+        return this._textResult(
+          `Cannot run "rush ${command}" while a build host this server did not start is running ` +
+            `(it holds the repository lock). Stop that watch first, then retry.`,
+          true
+        );
+      }
     }
 
     const result: ICommandResult = await CommandRunner.runRushCommandCaptureAsync([command, ...args]);
@@ -83,6 +107,21 @@ export class RushRunCommandTool extends BaseTool {
       sections.push('', '(no output)');
     }
 
-    return { content: [{ type: 'text', text: sections.join('\n') }] };
+    // If the command bounced off the repo lock, add a hint (e.g. an external watch we never connected to).
+    if (
+      result.status !== 0 &&
+      /Another Rush command is already running/i.test(result.stdout + result.stderr)
+    ) {
+      sections.push(
+        '',
+        'Hint: another Rush process holds the repository lock (likely a watch). Stop it and retry.'
+      );
+    }
+
+    return this._textResult(notice + sections.join('\n'));
+  }
+
+  private _textResult(text: string, isError: boolean = false): CallToolResult {
+    return { isError, content: [{ type: 'text', text }] };
   }
 }

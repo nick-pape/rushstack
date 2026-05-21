@@ -55,7 +55,7 @@ export class RushMCPServer extends McpServer {
     this._tools.push(new RushRebuildTool(this._buildHostClient));
     this._tools.push(new RushSetWatchStateTool(this._buildHostClient));
     this._tools.push(new RushAbortBuildTool(this._buildHostClient));
-    this._tools.push(new RushRunCommandTool());
+    this._tools.push(new RushRunCommandTool(this._buildHostClient));
   }
 
   private _registerTools(): void {

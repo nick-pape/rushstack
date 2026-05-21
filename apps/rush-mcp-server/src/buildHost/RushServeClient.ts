@@ -236,6 +236,45 @@ export class RushServeClient {
     this._killSpawnedHost();
   }
 
+  /** True if this client started the build host (so it is safe for us to stop it). */
+  public isHostSpawnedByUs(): boolean {
+    return !!this._spawnedChild && this._spawnedChild.exitCode === null;
+  }
+
+  /** True if currently connected to a build host. */
+  public isConnected(): boolean {
+    return !!this._webSocket && this._webSocket.readyState === WebSocket.OPEN;
+  }
+
+  /**
+   * Stops the build host this client started (releasing the repository lock) and resets the connection
+   * so the next `ensureReadyAsync()` re-establishes it. No-op if we did not start one. Resolves once the
+   * host process has actually exited.
+   */
+  public async stopSpawnedHostAsync(): Promise<void> {
+    const child: ChildProcess | undefined = this._spawnedChild;
+    const webSocket: WebSocket | undefined = this._webSocket;
+    this._webSocket = undefined;
+    this._readyPromise = undefined;
+    if (webSocket) {
+      try {
+        webSocket.close();
+      } catch {
+        // ignore
+      }
+    }
+    if (!child || child.exitCode !== null) {
+      this._spawnedChild = undefined;
+      return;
+    }
+    const exited: Promise<void> = new Promise<void>((resolve) => {
+      child.once('exit', () => resolve());
+    });
+    this._killSpawnedHost();
+    await exited;
+    this._spawnedChild = undefined;
+  }
+
   private async _establishConnectionAsync(): Promise<void> {
     // 1. Try to connect to an already-running host.
     try {
