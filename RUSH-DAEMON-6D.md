@@ -54,3 +54,36 @@ behave identically (manual regression — the unit tests don't cover the watch p
 - 6d-3: control channel + in-process `install`/`update`/`check`/`add` via the managers, with
   `quiesce`/`resume` around them (no lock release). Validate the repeated-install-in-one-process risk.
 - 6d-4: point the MCP at `rush daemon`.
+
+## 6d-2 / 6d-3 — the daemon action + in-process commands (sharpened, code-grounded)
+
+Findings from tracing the wiring (so the next build is turnkey):
+- Phased commands are constructed in `cli/RushCommandLineParser.ts` (~line 489, `new PhasedScriptAction({...})`)
+  from `commandLineConfiguration` entries; built-ins (`build`/`rebuild`) come from `DEFAULT_BUILD_COMMAND_JSON`
+  in `api/CommandLineConfiguration.ts` (a bulk command translated to phased). A `daemon` built-in would be
+  added the same way — but a bare always-watch `daemon` command is just `rush start` and adds nothing.
+- The value is **in-process mutating commands under the one held lock**. `check` is read-only
+  (safe-for-simultaneous) so it doesn't exercise the lock benefit; the compelling demo is in-process
+  `install`/`update` *while watching*.
+
+Design:
+1. `RushDaemonAction extends PhasedScriptAction` (or PhasedScriptAction stores the runner on a
+   `protected` field). The action needs a handle to the live `PhasedCommandRunner` to control it.
+2. Add to `PhasedCommandRunner`: keep a reference to the active `ProjectWatcher`; add
+   `quiesceAsync()` (pause the watcher, abort the in-flight execution via `_executionAbortController`,
+   run the `shutdownAsync` hook to stop IPC workers) and `resumeAsync()` (resume the watcher). The
+   watch loop blocks in `projectWatcher.waitForChangeAsync()`, so quiesce must interrupt that wait;
+   `ProjectWatcher.pause()` already exists — confirm it unblocks the wait, else add an interrupt.
+3. A control channel (unix domain socket at `common/temp/rushmcp-daemon.sock`, JSON-line protocol:
+   `{command:'install'|'update'|'check'|'add'|'status', args}`). The daemon: on a mutating request →
+   `quiesceAsync()` → `doBasicInstallAsync` / `PackageJsonUpdater.doRushUpdateAsync` /
+   `VersionMismatchFinder.rushCheck` IN-PROCESS (no re-lock; the daemon already holds the 'rush' lock) →
+   `resumeAsync()` → reply with the result. Serialize requests (a queue) so concurrent agents don't
+   collide.
+4. Register the action (built-in default command or via command-line config).
+5. MCP (6d-4): point `BuildHostDaemon` at `rush daemon` and route mutating commands to the socket.
+
+Validation gate (each step): rush-lib `heft test` 627/0 + local-rush regression
+(`rush build`, `rush start --watch`, and — for 6d-3 — `rush daemon` + socket: in-process install while
+watching, verify the watch resumes and the lock was never released). NOTE: `@microsoft/rush-lib` is
+published → a real PR needs a `rush change` entry.
