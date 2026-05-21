@@ -108,7 +108,7 @@ call these directly in-process without re-acquiring.
 - **Phase 1** — read-only MCP: observe + logs. ✅ **done, committed, validated live**
 - **Phase 2** — control the watch (rebuild / set-watch-state / abort). ✅ **done, validated live**
 - **Phase 3** — read-only rush commands (check/list) via shell-out. ✅ **done, validated via shim**
-- **Phase 4** — spawn-or-connect (stop requiring a pre-started watch).
+- **Phase 4** — spawn-or-connect (stop requiring a pre-started watch). ✅ **done, validated via shim**
 - **Phase 5** — mutating rush commands (the Path-1 stop-the-world dance).
 - **Phase 6** — multi-agent sharing + robustness (discovery file, race-safe spawn) → Path-2 decision.
 
@@ -133,9 +133,13 @@ noreply email during the first push — see Validation log).
 **File inventory:**
 - `apps/rush-mcp-server/src/buildHost/protocol.types.ts` — local mirror of rush-serve `/api` (events + commands).
 - `apps/rush-mcp-server/src/buildHost/RushServeClient.ts` — lazy wss client, in-memory snapshot,
-  `findOperations`, `sendCommandAsync`, https log fetch (`undefined` on 404). URL via
-  `RUSH_BUILD_STATUS_WS_URL` (default `wss://localhost:8443/`); TLS via `rejectUnauthorized:false`
-  (TODO: trust the debug CA).
+  `findOperations`, `sendCommandAsync`, https log fetch (`undefined` on 404), and **spawn-or-connect**:
+  tries the configured URL, and if unreachable + autostart, spawns the start command, scrapes the
+  ephemeral port from its stdout, and connects. Spawns detached and kills the process group on
+  dispose/exit. TLS via `rejectUnauthorized:false` (TODO: trust the debug CA).
+  Env config (all **`RUSHMCP_`**-prefixed — NOT `RUSH_`, see gotcha below):
+  `RUSHMCP_BUILD_STATUS_WS_URL` (default `wss://localhost:8443/`), `RUSHMCP_BUILD_AUTOSTART`
+  (default on), `RUSHMCP_BUILD_START_COMMAND` (default `rush start`), `RUSHMCP_BUILD_START_TIMEOUT_MS`.
 - `apps/rush-mcp-server/src/tools/build-status.tool.ts`, `build-logs.tool.ts`, `build-rebuild.tool.ts`,
   `build-watch-state.tool.ts`, `build-abort.tool.ts`.
 - Wired in `src/server.ts` + `src/tools/index.ts`. Added deps `ws ~8.20.0` + `@types/ws 8.5.5`.
@@ -173,6 +177,21 @@ noreply email during the first push — see Validation log).
   reads the upstream parent (microsoft/rushstack); created the PR via
   `gh api repos/nick-pape/rushstack/pulls` instead. Commit with inline
   `-c user.email='5674316+nick-pape@users.noreply.github.com' -c user.name='Nick Pape'`.
+- **Phase 4 live (via shim):** with the configured port free, the client auto-started
+  `rush start`, scraped its ephemeral port from stdout, connected, and returned status (~1.4s when cached).
+- **MAJOR gotcha — reserved `RUSH_` prefix:** the spawned `rush` inherits the parent env, and Rush
+  **errors out on any unrecognized `RUSH_`-prefixed variable** ("not recognized by this version of
+  Rush" → exit 1). Our config vars were originally `RUSH_BUILD_*`; renamed to `RUSHMCP_*`, and the
+  spawn also strips `RUSHMCP_*` from the child env. (Don't squat on Rush's namespace — also an
+  upstream-review concern.)
+- **Reaping limitation:** spawn-detached + kill-process-group works when our cleanup runs. The sandbox
+  `install-run-rush.js` shim spawns the *real* rush in its own group, so if the parent dies abruptly
+  (e.g. SIGKILL, or a `| head` EPIPE during testing) the real rush is orphaned (reparented to init)
+  and keeps the repo lock → next `rush start` fails with "Another Rush command is already running."
+  In production the global `rush` launcher runs in-process (single tree), so this is mostly a sandbox
+  artifact; for robustness consider `SubprocessTerminator` from `@rushstack/node-core-library`.
+  Cleanup during testing: `pkill -f 'install-run/@microsoft\+rush.*rush start'` and
+  `rm -f common/temp/rush#*.lock`.
 
 ## 9. Running the live test harness (repro)
 
@@ -185,15 +204,20 @@ Wired into THIS repo for validation (kept uncommitted — it's a harness, not th
    alone gives "Manifest not found"; `--bypass-policy` skips this repo's git-email policy).
 5. `rush start --only @rushstack/tree-pattern` (small prebuilt project). It prints
    `Content is being served from: https://localhost:<PORT>/`.
-6. Point the client at it: `RUSH_BUILD_STATUS_WS_URL=wss://localhost:<PORT>/` and call the built tools
+6. Point the client at it: `RUSHMCP_BUILD_STATUS_WS_URL=wss://localhost:<PORT>/` and call the built tools
    in `apps/rush-mcp-server/lib-commonjs/...`.
-- Git identity isn't set in this repo; commit with inline
-  `-c user.email=nickpape@outlook.com -c user.name="Nick Pape"`. Pre-commit hook runs `rush prettier`.
+- Git identity: the env sets `GIT_AUTHOR_EMAIL`/`GIT_COMMITTER_EMAIL` to the private address, which
+  **overrides `-c user.email`**. GitHub blocks pushing the private email, so commit with the env vars
+  overridden, e.g. prefix with
+  `GIT_AUTHOR_EMAIL=5674316+nick-pape@users.noreply.github.com GIT_COMMITTER_EMAIL=5674316+nick-pape@users.noreply.github.com`.
+  Pre-commit hook runs `rush prettier`.
 
 ## 10. Open questions / next steps
 
 - Cold-watch handling (behavior #1) — surface state or auto-warm?
-- Discovery / spawn-or-connect (Phase 4): rush-serve has no discovery file; likely add one
-  (port + wsPath + logServePath + repoId + pid), upstream-able.
+- Phase 6 (multi-agent sharing): a discovery file so a second MCP can find a watch the first one
+  spawned (rush-serve uses an ephemeral port with no discovery today); likely add
+  port + wsPath + logServePath + repoId + pid, upstream-able. Race-safe spawn (LockFile).
+- Reaping hardening: `SubprocessTerminator` instead of process-group kill (see §8).
 - TLS hardening: trust the debug CA instead of `rejectUnauthorized:false`.
 - Whether to commit the rush-serve test harness or document it as setup.
