@@ -7,3 +7,5 @@ export { RushProjectDetailsTool } from './project-details.tool';
 export { RushCommandValidatorTool } from './rush-command-validator.tool';
 export { RushWorkspaceDetailsTool } from './workspace-details';
 export { RushConflictResolverTool } from './conflict-resolver.tool';
+export { RushBuildStatusTool } from './build-status.tool';
+export { RushBuildLogsTool } from './build-logs.tool';
