@@ -1,0 +1,186 @@
+# rush-ipc-mcp — findings & design log
+
+A living document for the effort to expose a running Rush build/watch host to agents via MCP.
+Update this as work proceeds (append to the Validation log; revise sections in place).
+
+Owner: nickpape · Started 2026-05-21
+
+---
+
+## 1. Goal & motivation
+
+Let agents observe and control a Rush build **without running `rush` directly**, because direct
+invocation is: (A) token-wasteful, (B) breaks with parallel agents (they fight the repo lock),
+(C) not visible, (D) impossible without giving the agent a shell.
+
+Originally conceived as a standalone `rush-ipc-mcp`; refined to a feature **inside the existing
+`@rushstack/mcp-server`** (first-class tools, not the disliked plugin framework — also the
+upstream-friendly / "makes Pete happy" path).
+
+## 2. Architecture decisions
+
+- **Topology = wrap rush-serve.** The long-lived build host is `rush start` running
+  `@rushstack/rush-serve-plugin`, which already exposes an HTTP/2 + WebSocket server. The MCP is a
+  thin Layer-2 client that connects to that WebSocket and re-exposes it as MCP tools. Each agent gets
+  its own short-lived stdio MCP process; all share one `rush start`.
+- **Code location = extend `apps/rush-mcp-server`** with first-class tools (cohesive `buildHost/`
+  subfolder, easy to relocate). Not a new Rush package; not an MCP plugin.
+- **v1 scope = observe + control watch + logs + run rush cmds.**
+
+## 3. How Rush's "IPC" actually works (two layers)
+
+Rush's built-in "IPC" is **not** a daemon you connect to. It's parent→child worker lifecycle within
+one `rush <cmd> --watch` process (the host).
+
+- **Layer 1 — host ↔ worker** (Node `child_process` fork IPC, stdio includes `'ipc'`):
+  protocol in `libraries/operation-graph/src/protocol.types.ts`. Host→worker: run/cancel/exit/sync.
+  Worker→host: sync/requestRun/after-execute. Worker side = `WatchLoop.runIPCAsync()`
+  (`libraries/operation-graph/src/WatchLoop.ts`); host side = `IPCOperationRunner` +
+  `IPCOperationRunnerPlugin` (`libraries/rush-lib/src/logic/operations/`). Keeps per-`project#phase`
+  build tools warm across rebuilds. Gated by experiment `useIPCScriptsInWatchMode` + `--no-ipc`;
+  fires only for projects with `<phase>:ipc` / `<phase>:incremental:ipc` scripts. Carries
+  `OperationStatus`, not logs (logs flow over stdout/stderr).
+- **Layer 2 — host ↔ observer** (WebSocket): `rush-plugins/rush-serve-plugin` taps host hooks
+  (createOperations / beforeExecuteOperations / onOperationStatusChanged / afterExecuteOperations)
+  and rebroadcasts. **This is the observability + control plane our MCP consumes.**
+
+Watch control today (TTY only) lives in `PhasedScriptAction._registerWatchModeInterface`: keys
+`q` quit, `a` abort, `w` pause/resume, `i` invalidate-all, `c` changed-only, `b` build-once,
+`x` reset child procs. Not programmatic. Per-project granularity = invalidate, not subscribe.
+
+Logs/state on disk: `<project>/.rush/operations/<phase>/*.log` (+ `.error.log`, jsonl);
+timing/cobuild in `.rush/temp/operation/<phase>/state.json`.
+
+rush-lib's public API is model/config-centric; the CLI **actions** (install/build managers) are NOT
+exported. External tools load via `@rushstack/rush-sdk` (supports deep imports
+`@rushstack/rush-sdk/lib/...`).
+
+## 4. rush-serve WebSocket protocol (Layer-2, what we consume)
+
+Source of truth: `rush-plugins/rush-serve-plugin/src/api.types.ts` (types-only entrypoint
+`@rushstack/rush-serve-plugin/api`). We keep a local mirror at
+`apps/rush-mcp-server/src/buildHost/protocol.types.ts` to avoid a runtime dep — keep them in sync.
+
+- **Server→client events:** `sync` (full ops + sessionInfo + overall status, on connect/request),
+  `before-execute` (ops at pass start), `status-change` (batched per-op deltas, debounced via
+  setImmediate), `after-execute` (ops + overall status).
+- **Client→server commands:** `sync`, `invalidate {operationNames}`, `abort-execution`,
+  `set-enabled-states {name → never|changed|affected|default}`.
+- **`IOperationInfo`:** name, dependencies[], packageName, phaseName, enabled, silent, noop, status
+  (PascalCase), logFileURLs {text,error,jsonl} (serve-relative), startTime, endTime
+  (**not wall-clock — only completed ops yield a meaningful duration**).
+- Transport: HTTP/2 secure server with a self-signed debug cert (`CertificateManager`); ephemeral
+  port unless a `portParameterLongName` is configured. Logs served as static files at `logServePath`.
+- **Lives inside `rush start`; dies with it.** Not a cross-invocation daemon — persistence is still
+  ours to add (later phase).
+
+## 5. Locking model & the install/build coordination problem
+
+Decisive constraint, confirmed in code: repo-wide lock `'rush'` in `commonTempFolder`, acquired
+non-blocking (`LockFile.tryAcquire`) in `BaseConfiglessRushAction.onExecuteAsync()`
+(`libraries/rush-lib/src/cli/actions/BaseRushAction.ts` ~line 68). Held for the **whole command**
+(released on process exit). On contention: prints "Another Rush command is already running" and
+`process.exit(1)` — instant, doesn't queue. Skipped by `safeForSimultaneousRushProcesses=true`:
+**check, change, deploy, list, scan** (read-only, runnable alongside a watch).
+
+Therefore:
+- Read-only commands → shell out anytime, even during a watch.
+- Mutating commands (install/update/add/remove) are blocked by the lock AND inherently stop-the-world
+  (they rewrite node_modules under a running build).
+
+**Key seam:** the lock is at the **action** layer, not the **manager** layer. Reusable, CLI-decoupled
+entry points exist: install/update → `InstallManagerFactory.getInstallManagerAsync()` →
+`installManager.doInstallAsync()`; add/remove → `PackageJsonUpdater.doRushUpdateAsync()`; check →
+`VersionMismatchFinder.rushCheck()` (static, already lock-free). A daemon that holds the lock once can
+call these directly in-process without re-acquiring.
+
+**Two paths for "run other rush commands":**
+- **Path 1 (stopgap, current direction):** wrap `rush start`; shell out read-only cmds; for install do
+  a coarse stop-watch → install → relaunch (loses warm workers).
+- **Path 2 (the `rush daemon` refactor):** a first-class long-lived process that owns the lock once,
+  hosts the watch (operation-graph + ProjectWatcher + rush-serve WS), and runs install/update/check/add
+  in-process via the manager classes, serializing internally. Aligns with the existing "long-lived
+  operation graph" TODOs in `PhasedScriptAction` / `IPCOperationRunnerPlugin`; upstream-worthy.
+
+## 6. Phasing plan
+
+- **Phase 0** — live target + protocol spike. *(done implicitly while validating Phase 1)*
+- **Phase 1** — read-only MCP: observe + logs. ✅ **done, committed, validated live**
+- **Phase 2** — control the watch (rebuild / set-watch-state / abort). ✅ **done, validated live**
+- **Phase 3** — read-only rush commands (check/list/change/scan) via shell-out.
+- **Phase 4** — spawn-or-connect (stop requiring a pre-started watch).
+- **Phase 5** — mutating rush commands (the Path-1 stop-the-world dance).
+- **Phase 6** — multi-agent sharing + robustness (discovery file, race-safe spawn) → Path-2 decision.
+
+## 7. Implementation status
+
+Branch `nickpape/mcp-build-host-tools`. Phase 1 committed as `93ff2f453c`. Phase 2 implemented,
+compiles green, validated live — **not yet committed**.
+
+**Tools (all in `@rushstack/mcp-server`, sharing one lazy `RushServeClient`):**
+- `rush_build_status` — compact: host id, overall status, status counts, only non-green ops; `project`
+  filter + `includeAll`.
+- `rush_build_logs` — per-project/phase log, `tailLines` (default 200) + `errorsOnly`; disambiguates
+  multiple phases; "no errors" when stderr log absent.
+- `rush_rebuild` — invalidate a project's operations (force rebuild).
+- `rush_set_watch_state` — set enabled state (never|changed|affected|default) per project/phase.
+- `rush_abort_build` — abort the current execution pass.
+
+**File inventory:**
+- `apps/rush-mcp-server/src/buildHost/protocol.types.ts` — local mirror of rush-serve `/api` (events + commands).
+- `apps/rush-mcp-server/src/buildHost/RushServeClient.ts` — lazy wss client, in-memory snapshot,
+  `findOperations`, `sendCommandAsync`, https log fetch (`undefined` on 404). URL via
+  `RUSH_BUILD_STATUS_WS_URL` (default `wss://localhost:8443/`); TLS via `rejectUnauthorized:false`
+  (TODO: trust the debug CA).
+- `apps/rush-mcp-server/src/tools/build-status.tool.ts`, `build-logs.tool.ts`, `build-rebuild.tool.ts`,
+  `build-watch-state.tool.ts`, `build-abort.tool.ts`.
+- Wired in `src/server.ts` + `src/tools/index.ts`. Added deps `ws ~8.20.0` + `@types/ws 8.5.5`.
+
+## 8. Validation log & gotchas (chronological)
+
+- **Build:** fresh checkout → first build needs the toolchain via `rush build --to @rushstack/mcp-server`
+  (~2 min); thereafter `rush build --only @rushstack/mcp-server` (~11 s).
+- **Compile gotcha:** `ClientRequest` is exported from `node:http`, not `node:https`.
+- **Phase 1 live (against real `rush start` + rush-serve):** status (compact/includeAll/filter),
+  multi-phase log disambiguation, and HTTPS log tail all worked.
+- **Log gotcha (fixed):** `.error.log` only exists when there's stderr → `errorsOnly` 404'd on clean
+  builds. `fetchLogTextAsync` now returns `undefined` on 404; the logs tool reports "no errors."
+- **Lock observed live:** `rush build` refused while the watch held the lock ("Another Rush command is
+  already running"). Workaround for compiling during a watch: run the project's local
+  `apps/rush-mcp-server/node_modules/.bin/heft build` (bypasses the orchestrator lock).
+- **Phase 2 live:** `rush_rebuild` fired while the watch was idle produced
+  `Watch Status: Projects were invalidated: @rushstack/tree-pattern (build) (Invalidated via WebSocket)`
+  → fresh build cycle. set-watch-state and abort accepted.
+- **rush-serve behavior #1 (cold watch):** `invalidate` / `set-enabled-states` are **no-ops until the
+  first watch iteration runs**, because rush-serve captures `context.invalidateOperation` in its
+  createOperations tap and `PhasedScriptAction` only supplies it in the watch loop (~line 928), not the
+  initial build. Design implication: MCP may want to surface "watch not warmed yet" or nudge an initial
+  iteration so control tools work immediately.
+- **rush-serve behavior #2 (coalescing):** an `invalidate` sent while a build is in-flight folds into
+  the running build (no separate cycle).
+
+## 9. Running the live test harness (repro)
+
+Wired into THIS repo for validation (kept uncommitted — it's a harness, not the feature):
+1. `common/autoinstallers/plugins/package.json` ← add `@rushstack/rush-serve-plugin@5.175.1`.
+2. `common/config/rush/rush-plugins.json` ← register the plugin (autoinstaller `plugins`).
+3. `common/config/rush-plugins/rush-serve-plugin.json` ← `{ phasedCommands:["start"],
+   buildStatusWebSocketPath:"/", logServePath:"/log" }`.
+4. `rush update --bypass-policy` (full update harvests the plugin manifest — `update-autoinstaller`
+   alone gives "Manifest not found"; `--bypass-policy` skips this repo's git-email policy).
+5. `rush start --only @rushstack/tree-pattern` (small prebuilt project). It prints
+   `Content is being served from: https://localhost:<PORT>/`.
+6. Point the client at it: `RUSH_BUILD_STATUS_WS_URL=wss://localhost:<PORT>/` and call the built tools
+   in `apps/rush-mcp-server/lib-commonjs/...`.
+- Git identity isn't set in this repo; commit with inline
+  `-c user.email=nickpape@outlook.com -c user.name="Nick Pape"`. Pre-commit hook runs `rush prettier`.
+
+## 10. Open questions / next steps
+
+- Commit Phase 2 (feature files only)?
+- Phase 3: read-only `rush check`/`list` via the existing `CommandRunner` shell-out.
+- Cold-watch handling (behavior #1) — surface state or auto-warm?
+- Discovery / spawn-or-connect (Phase 4): rush-serve has no discovery file; likely add one
+  (port + wsPath + logServePath + repoId + pid), upstream-able.
+- TLS hardening: trust the debug CA instead of `rejectUnauthorized:false`.
+- Whether to commit the rush-serve test harness or document it as setup.
