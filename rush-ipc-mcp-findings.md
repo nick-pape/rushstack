@@ -355,3 +355,46 @@ flush telemetry on daemon shutdown; decide per-command whether pre/post-install 
 6d-1: existing `rush start`/`rush build`/`--watch` regression suite. 6d-2: MCP tools vs `rush daemon`.
 6d-3: a harness that issues N installs + builds in one daemon process and asserts correctness +
 no leaks. 6d-4: the multi-agent + mutating flows from §8, now daemon-mediated.
+
+### 6d execution log — keystone spike (2026-05-21)
+
+Tried to de-risk the load-bearing assumption ("can a long-lived process hold the 'rush' lock once and
+run install in-process, twice?") with a throwaway external spike before touching core. It surfaced two
+hard constraints that **redirect** 6d — exactly what de-risking-first is for:
+
+1. **rush-lib ships as a webpack bundle** (`@rushstack/webpack-deep-imports-plugin`). The
+   `lib-commonjs/*` files are stubs that resolve through the bundle runtime; you cannot `require` an
+   internal module standalone (fails with a numeric `__webpack_require__('NNNN')` MODULE_NOT_FOUND).
+2. **No external in-process shortcut to the managers.** rush-sdk's `RushSdkLoader` loads the repo's
+   *published* Rush (from `common/temp/install-run/@microsoft+rush@<ver>`), not local source, and
+   `RushInternals.loadModule` (a thin `require()` wrapper, not an allowlist) on
+   `logic/installManager/doBasicInstallAsync` throws *"not implemented by Rush 5.175.1"* (the path
+   isn't loadable in the published bundle / version skew).
+
+**Conclusion (evidence-backed):** in-process `install`/`update` cannot be driven from an external
+daemon via rush-sdk. 6d's in-process model **must** be implemented *inside* rush-lib — a real
+`rush daemon` action that calls `doBasicInstallAsync` as a same-bundle call (exactly how `InstallAction`
+already does every run). The genuinely-novel risk (the *same* process running install **twice**) can
+therefore only be validated from inside rush-lib; it remains open.
+
+**Why this wasn't slammed out here:** the remaining 6d work is a rush-lib *core* change (extract the
+watch engine from `PhasedScriptAction` + add a `rush daemon` action). Its only safe guardrail is
+rush-lib's full test suite + the `rush build`/`rush start`/`--watch` regression matrix — not runnable
+end-to-end in this session. Landing a 1196-line central-action refactor "by vibes" would risk silently
+breaking `rush build` for the whole repo (incl. our own daemon harness). Engineering-sense call: do it
+as a dedicated, test-guarded upstream PR.
+
+### 6d-1 extraction surface (turnkey for that PR)
+
+`PhasedScriptAction` (1196 lines) splits into: **(a) the CLI action** — keeps the constructor's
+~20 `CommandLineParameter` fields + `runAsync` parameter parsing and the build of
+`ICreateOperationsContext`/execution options; and **(b) a reusable `PhasedCommandRunner`** — receives
+the resolved config (phases, resolved project selection, parallelism, terminal, hooks, abort
+controllers, build-cache config, `getInputsSnapshotAsync`) and owns the engine:
+`_runInitialPhasesAsync` (646), `_registerWatchModeInterface` (725), `_runWatchPhasesAsync` (824),
+`_executeOperationsAsync` (970), `_doBeforeTask` (1172), `_doAfterTask` (1186), plus the
+`ProjectWatcher` wiring. It must expose `runInitialAsync()`, `runWatchLoopAsync(abortSignal)`, and
+`quiesceAsync()`/`resumeAsync()` (pause ProjectWatcher + cancel in-flight ops + run the `shutdownAsync`
+hook) **without releasing the 'rush' lock**. `PhasedScriptAction` becomes a thin wrapper; the new
+`rush daemon` action constructs a `PhasedCommandRunner` directly. Guardrail: existing watch tests +
+`rush build`/`start` behave identically.
