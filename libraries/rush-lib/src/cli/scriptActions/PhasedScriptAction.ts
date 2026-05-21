@@ -21,6 +21,7 @@ import {
   type IInitialRunPhasesOptions,
   type IRunPhasesOptions
 } from './PhasedCommandRunner';
+import type { DaemonControlServer } from './DaemonControlServer';
 import type { IOperationExecutionManagerOptions } from '../../logic/operations/OperationExecutionManager';
 import { RushConstants } from '../../logic/RushConstants';
 import { EnvironmentVariableNames } from '../../api/EnvironmentConfiguration';
@@ -597,7 +598,29 @@ export class PhasedScriptAction extends BaseScriptAction<IPhasedCommandConfig> i
           buildCacheConfiguration.cacheWriteEnabled = false;
         }
 
-        await runner.runWatchPhasesAsync(internalOptions);
+        // EXPERIMENTAL (rush daemon prototype): when RUSHMCP_DAEMON_SOCKET is set, expose an in-process
+        // control channel so this long-lived watch process can also run Rush commands under the single
+        // repository lock it already holds. Slated to become a first-class "rush daemon" action.
+        // eslint-disable-next-line dot-notation
+        const daemonSocketPath: string | undefined = process.env['RUSHMCP_DAEMON_SOCKET'];
+        let daemonControlServer: DaemonControlServer | undefined;
+        if (daemonSocketPath) {
+          const { DaemonControlServer } = await import(
+            /* webpackChunkName: 'DaemonControlServer' */ './DaemonControlServer'
+          );
+          daemonControlServer = new DaemonControlServer({
+            socketPath: daemonSocketPath,
+            rushConfiguration: this.rushConfiguration,
+            terminal
+          });
+          daemonControlServer.start();
+        }
+
+        try {
+          await runner.runWatchPhasesAsync(internalOptions);
+        } finally {
+          daemonControlServer?.close();
+        }
         terminal.writeDebugLine(`Watch mode exited.`);
       }
     } finally {
