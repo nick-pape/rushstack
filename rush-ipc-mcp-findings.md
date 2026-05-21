@@ -112,7 +112,7 @@ call these directly in-process without re-acquiring.
 - **Phase 5** — mutating rush commands (the Path-1 stop-the-world dance). ✅ **done, validated via shim**
 - **Phase 6 / Path 2 (chosen)** — `rush daemon`: a persistent supervisor owns one shared watch; see §11.
   - 6a — daemon foundation (supervisor + discovery + graceful shutdown). ✅ **done, validated standalone**
-  - 6b — wire the MCP client to start-or-connect to the daemon (+ shutdown tool). ⏳ next
+  - 6b — wire the MCP client to start-or-connect to the daemon (+ shutdown tool). ✅ **done, validated**
   - 6c — daemon-mediated mutating commands + supervision/auto-restart.
   - 6d — upstream `rush daemon` in rush-lib with in-process managers (no child `rush start`).
 
@@ -210,6 +210,13 @@ noreply email during the first push — see Validation log).
   `common/temp/rushmcp-build-host.json` {webSocketUrl, daemonPid, startedAt}. A raw WS client connected
   to the discovered URL and got `[sync] ops=4 status=Success`. `SIGTERM` to the daemon → discovery
   cleared, watch tree reaped (no orphans) — graceful shutdown confirmed.
+- **Phase 6b live (client wired to daemon, via shim):** client A (a node process) cold-started the
+  daemon and exited; the daemon **persisted** (same pid alive, 1 daemon process). Client B (a separate
+  process) **reused the same daemon** via the discovery file — same pid + URL, still 1 daemon. A
+  mutating `install` stopped the shared daemon (freed the lock, ran at exit 0, no orphan; restarts
+  lazily). `rush_shutdown_host` stopped the daemon (dead, discovery cleared). Client model changed:
+  the client no longer owns the watch (the daemon does); `disposeAsync` is a no-op so the shared host
+  survives MCP exits; mutating commands stop the daemon (any client can) rather than refusing.
 
 ## 9. Running the live test harness (repro)
 
