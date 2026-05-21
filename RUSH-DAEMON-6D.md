@@ -112,9 +112,19 @@ and the watch then detected a new change and rebuilt. rush-lib `heft test` 627/0
 the first in-process install aborted until a git identity was set (`git config --local user.email ...`).
 Real users have this; the daemon may want to pass `bypassPolicy` or surface the policy error cleanly.
 
-## Remaining
-- update/add commands (update needs `allowShrinkwrapUpdates:true` — a different manager call than
-  `doBasicInstallAsync`); request queue so concurrent agents serialize.
-- Promote the env-gated prototype to a first-class `RushDaemonAction` (registration).
-- 6d-4: point the MCP `BuildHostDaemon` at this control socket (run mutating commands in-process via
-  the daemon instead of stop-daemon→install→restart).
+## 6d-4 — MCP wired to the in-process control socket ✅ DONE (validated)
+
+Branch `nickpape/rush-daemon-mcp-integration` (merge of the MCP + daemon branches). `BuildHostDaemon`
+starts the watch with `RUSHMCP_DAEMON_SOCKET` and advertises `controlSocketPath` in the discovery file;
+`RushServeClient.sendDaemonCommandAsync` connects to it; `rush_run_command` routes supported mutating
+commands (`install`) through the socket — in-process in the watch, kept warm, lock never released —
+falling back to stop-daemon for the rest. **Validated end-to-end (local rush):** MCP client → daemon →
+local rush watch (control socket + rush-serve) → `install` ran in-process ("watch kept warm, lock never
+released", "Install completed."); the watch was still serving afterward.
+
+## Remaining (polish; upstream deferred per owner)
+- Command queue ✅ done (two concurrent installs serialize).
+- `update`/`add` over the socket (update needs `allowShrinkwrapUpdates:true` — a different manager call;
+  these mutate the lockfile, messier to validate in this repo).
+- Promote the env-gated prototype to a first-class `RushDaemonAction` for the eventual upstream PR
+  (with `rush change` entries for the published packages).
