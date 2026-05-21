@@ -611,7 +611,9 @@ export class PhasedScriptAction extends BaseScriptAction<IPhasedCommandConfig> i
           daemonControlServer = new DaemonControlServer({
             socketPath: daemonSocketPath,
             rushConfiguration: this.rushConfiguration,
-            terminal
+            rushGlobalFolder: this.rushGlobalFolder,
+            terminal,
+            runExclusiveAsync: (fn: () => Promise<void>) => runner.runExclusiveAsync(fn)
           });
           daemonControlServer.start();
         }

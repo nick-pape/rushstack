@@ -7,6 +7,7 @@ import { FileSystem } from '@rushstack/node-core-library';
 import { type ITerminal, Terminal, StringBufferTerminalProvider } from '@rushstack/terminal';
 
 import type { RushConfiguration } from '../../api/RushConfiguration';
+import type { RushGlobalFolder } from '../../api/RushGlobalFolder';
 import { VersionMismatchFinder } from '../../logic/versionMismatch/VersionMismatchFinder';
 
 /**
@@ -27,7 +28,13 @@ interface IControlResponse {
 export interface IDaemonControlServerOptions {
   socketPath: string;
   rushConfiguration: RushConfiguration;
+  rushGlobalFolder: RushGlobalFolder;
   terminal: ITerminal;
+  /**
+   * Runs `fn` with the watch quiesced (paused, in-flight execution aborted, child processes stopped)
+   * and the repository lock still held, then resumes the watch. Used for mutating commands.
+   */
+  runExclusiveAsync: (fn: () => Promise<void>) => Promise<void>;
 }
 
 /**
@@ -123,6 +130,23 @@ export class DaemonControlServer {
         const terminal: Terminal = new Terminal(provider);
         VersionMismatchFinder.rushCheck(rushConfiguration, terminal);
         return provider.getOutput() + provider.getErrorOutput();
+      }
+      case 'install': {
+        // Mutating: rewrite node_modules under the held lock, with the watch quiesced.
+        const provider: StringBufferTerminalProvider = new StringBufferTerminalProvider(false);
+        const terminal: Terminal = new Terminal(provider);
+        await this._options.runExclusiveAsync(async () => {
+          const { doBasicInstallAsync } = await import('../../logic/installManager/doBasicInstallAsync');
+          await doBasicInstallAsync({
+            rushConfiguration,
+            rushGlobalFolder: this._options.rushGlobalFolder,
+            isDebug: false,
+            variant: undefined,
+            terminal,
+            subspace: rushConfiguration.defaultSubspace
+          });
+        });
+        return provider.getOutput() + provider.getErrorOutput() || 'Install completed.';
       }
       default: {
         throw new Error(`Unknown or unsupported command: "${command}"`);
