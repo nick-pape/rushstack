@@ -29,6 +29,11 @@
       "packageName": "@rushstack/rush-published-versions-json-plugin",
       "pluginName": "rush-published-versions-json-plugin",
       "autoinstallerName": "plugins"
+    },
+    {
+      "packageName": "@rushstack/rush-serve-plugin",
+      "pluginName": "rush-serve-plugin",
+      "autoinstallerName": "plugins"
     }
   ]
 }
