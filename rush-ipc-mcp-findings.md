@@ -110,7 +110,11 @@ call these directly in-process without re-acquiring.
 - **Phase 3** — read-only rush commands (check/list) via shell-out. ✅ **done, validated via shim**
 - **Phase 4** — spawn-or-connect (stop requiring a pre-started watch). ✅ **done, validated via shim**
 - **Phase 5** — mutating rush commands (the Path-1 stop-the-world dance). ✅ **done, validated via shim**
-- **Phase 6** — multi-agent sharing + robustness (discovery file, race-safe spawn) → Path-2 decision.
+- **Phase 6 / Path 2 (chosen)** — `rush daemon`: a persistent supervisor owns one shared watch; see §11.
+  - 6a — daemon foundation (supervisor + discovery + graceful shutdown). ✅ **done, validated standalone**
+  - 6b — wire the MCP client to start-or-connect to the daemon (+ shutdown tool). ⏳ next
+  - 6c — daemon-mediated mutating commands + supervision/auto-restart.
+  - 6d — upstream `rush daemon` in rush-lib with in-process managers (no child `rush start`).
 
 ## 7. Implementation status
 
@@ -201,6 +205,11 @@ noreply email during the first push — see Validation log).
   (exit 0), and left no orphan — `isHostSpawnedByUs` went true→false. The external-watch refusal branch
   (`isConnected && !isHostSpawnedByUs`) is trivial logic and was not stood up as a separate e2e.
   Note: `rush install` needs `--bypass-policy` in this repo (git-email policy); real users won't.
+- **Phase 6a live (daemon foundation, via shim):** ran `node lib-commonjs/daemon/start.js <repo>`; it
+  spawned the watch, scraped the port, printed `Build host ready at wss://localhost:33309/` and wrote
+  `common/temp/rushmcp-build-host.json` {webSocketUrl, daemonPid, startedAt}. A raw WS client connected
+  to the discovered URL and got `[sync] ops=4 status=Success`. `SIGTERM` to the daemon → discovery
+  cleared, watch tree reaped (no orphans) — graceful shutdown confirmed.
 
 ## 9. Running the live test harness (repro)
 
@@ -229,3 +238,33 @@ Wired into THIS repo for validation (kept uncommitted — it's a harness, not th
   port + wsPath + logServePath + repoId + pid, upstream-able. Race-safe spawn (LockFile).
 - TLS hardening: trust the debug CA instead of `rejectUnauthorized:false`.
 - Whether to commit the rush-serve test harness or document it as setup.
+
+## 11. `rush daemon` (Path 2) design
+
+Chosen over the "MCP spawns a persistent watch" hack: a dedicated supervisor process owns the shared
+watch, so its lifecycle is independent of any one MCP client.
+
+**Topology (current increment).** A long-lived `BuildHostDaemon` process (singleton via a
+`rushmcp-daemon` LockFile) supervises one `rush start` + rush-serve watch (reused as the watch
+engine), discovers its ephemeral port, and advertises it in `common/temp/rushmcp-build-host.json`.
+MCP clients read that file and connect to the watch's WebSocket directly (reusing Phases 1–2). The
+watch is reaped when the *daemon* exits (SubprocessTerminator), not when a client exits → it survives
+and is shared across agents.
+
+**Lifecycle.** Client need-a-host flow becomes: configured URL → discovery file → else start the
+daemon (detached, un-reaped, persistent) and wait for discovery. Mutating commands: a client stops
+the daemon (it knows `daemonPid`) to free the lock, runs the command, and the daemon restarts lazily
+on the next build query. The daemon is stopped explicitly (a `rush_shutdown_host` tool) — it is NOT
+reaped on client exit.
+
+**Files:** `src/daemon/discoveryFile.ts` (read/write/validate; staleness = daemon pid dead),
+`src/daemon/BuildHostDaemon.ts` (supervisor), `src/daemon/start.ts` (entrypoint).
+
+**Increments:** 6a foundation ✅ · 6b client start-or-connect + shutdown tool · 6c daemon-mediated &
+queued mutating commands + auto-restart supervision · 6d the real upstream `rush daemon` in rush-lib
+that holds the repo lock once and runs install/update/check via the manager classes **in-process**
+(no child `rush start`), per the action-vs-manager lock seam in §5.
+
+**Known tensions:** with a shared watch, mutating commands are inherently stop-the-world for all
+attached agents (one of them stops the daemon); 6c should queue/coordinate these. Persistence means
+the daemon must be shut down explicitly or by staleness — orphan management moves into the daemon.
