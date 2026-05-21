@@ -107,15 +107,16 @@ call these directly in-process without re-acquiring.
 - **Phase 0** — live target + protocol spike. *(done implicitly while validating Phase 1)*
 - **Phase 1** — read-only MCP: observe + logs. ✅ **done, committed, validated live**
 - **Phase 2** — control the watch (rebuild / set-watch-state / abort). ✅ **done, validated live**
-- **Phase 3** — read-only rush commands (check/list/change/scan) via shell-out.
+- **Phase 3** — read-only rush commands (check/list) via shell-out. ✅ **done, validated via shim**
 - **Phase 4** — spawn-or-connect (stop requiring a pre-started watch).
 - **Phase 5** — mutating rush commands (the Path-1 stop-the-world dance).
 - **Phase 6** — multi-agent sharing + robustness (discovery file, race-safe spawn) → Path-2 decision.
 
 ## 7. Implementation status
 
-Branch `nickpape/mcp-build-host-tools`. Phase 1 committed as `93ff2f453c`. Phase 2 implemented,
-compiles green, validated live — **not yet committed**.
+Branch `nickpape/mcp-build-host-tools`, pushed to the fork as **in-fork PR #20**
+(`nick-pape/rushstack` main ← branch). Phases 1–3 committed (commit hashes were rewritten to the
+noreply email during the first push — see Validation log).
 
 **Tools (all in `@rushstack/mcp-server`, sharing one lazy `RushServeClient`):**
 - `rush_build_status` — compact: host id, overall status, status counts, only non-green ops; `project`
@@ -125,6 +126,9 @@ compiles green, validated live — **not yet committed**.
 - `rush_rebuild` — invalidate a project's operations (force rebuild).
 - `rush_set_watch_state` — set enabled state (never|changed|affected|default) per project/phase.
 - `rush_abort_build` — abort the current execution pass.
+- `rush_run_command` — run a read-only Rush command (allowlist: `check`, `list`) via shell-out;
+  allowlist enforced in BOTH the input schema and the handler. Uses
+  `CommandRunner.runRushCommandCaptureAsync` (resolves with output regardless of exit code).
 
 **File inventory:**
 - `apps/rush-mcp-server/src/buildHost/protocol.types.ts` — local mirror of rush-serve `/api` (events + commands).
@@ -158,6 +162,17 @@ compiles green, validated live — **not yet committed**.
   iteration so control tools work immediately.
 - **rush-serve behavior #2 (coalescing):** an `invalidate` sent while a build is in-flight folds into
   the running build (no separate cycle).
+- **Phase 3 live (via shim):** `rush` isn't on PATH in the sandbox; tested with a `rush` shim that
+  delegates to `common/scripts/install-run-rush.js`. `rush list` / `rush check` return real output
+  (exit 0). **Defense-in-depth finding:** enforce the allowlist *in the handler*, not only via the zod
+  schema — calling `executeAsync` directly bypasses schema validation (a direct call accidentally ran
+  `rush install`, which bailed at the git-email policy before changing anything).
+- **PR/push gotchas:** GitHub blocked the push (private email) → rewrote the commits to
+  `5674316+nick-pape@users.noreply.github.com` via `git filter-branch` (`rebase --exec --reset-author`
+  did NOT take — rebase re-exports the original author env). `gh pr create` failed under SAML because it
+  reads the upstream parent (microsoft/rushstack); created the PR via
+  `gh api repos/nick-pape/rushstack/pulls` instead. Commit with inline
+  `-c user.email='5674316+nick-pape@users.noreply.github.com' -c user.name='Nick Pape'`.
 
 ## 9. Running the live test harness (repro)
 
@@ -177,8 +192,6 @@ Wired into THIS repo for validation (kept uncommitted — it's a harness, not th
 
 ## 10. Open questions / next steps
 
-- Commit Phase 2 (feature files only)?
-- Phase 3: read-only `rush check`/`list` via the existing `CommandRunner` shell-out.
 - Cold-watch handling (behavior #1) — surface state or auto-warm?
 - Discovery / spawn-or-connect (Phase 4): rush-serve has no discovery file; likely add one
   (port + wsPath + logServePath + repoId + pid), upstream-able.
