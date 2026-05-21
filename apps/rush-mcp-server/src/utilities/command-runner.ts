@@ -5,7 +5,7 @@ import type { ChildProcess } from 'node:child_process';
 
 import { Executable, type IExecutableSpawnSyncOptions } from '@rushstack/node-core-library';
 
-interface ICommandResult {
+export interface ICommandResult {
   status: number;
   stdout: string;
   stderr: string;
@@ -46,7 +46,8 @@ export class CommandRunner {
   private static async _executeCommandAsync(
     command: string,
     args: string[],
-    options?: IExecutableSpawnSyncOptions
+    options?: IExecutableSpawnSyncOptions,
+    allowNonZeroExit: boolean = false
   ): Promise<ICommandResult> {
     const commandPath: string = this._resolveCommand(command);
 
@@ -64,7 +65,7 @@ export class CommandRunner {
       });
 
       childProcess.on('close', (status) => {
-        if (status !== 0) {
+        if (status !== 0 && !allowNonZeroExit) {
           reject(new CommandExecutionError(command, args, stderr, status ?? 1));
           return;
         }
@@ -89,6 +90,18 @@ export class CommandRunner {
     options?: IExecutableSpawnSyncOptions
   ): Promise<ICommandResult> {
     return this._executeCommandAsync('rush', args, options);
+  }
+
+  /**
+   * Runs a `rush` command and resolves with the result regardless of exit code (instead of throwing),
+   * so callers can inspect stdout/stderr/status. Useful for read-only commands like `rush check` that
+   * exit non-zero to signal findings.
+   */
+  public static async runRushCommandCaptureAsync(
+    args: string[],
+    options?: IExecutableSpawnSyncOptions
+  ): Promise<ICommandResult> {
+    return this._executeCommandAsync('rush', args, options, true);
   }
 
   public static async runRushXCommandAsync(
