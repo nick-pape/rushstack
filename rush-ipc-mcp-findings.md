@@ -288,3 +288,70 @@ that holds the repo lock once and runs install/update/check via the manager clas
 **Known tensions:** with a shared watch, mutating commands are inherently stop-the-world for all
 attached agents (one of them stops the daemon); 6c should queue/coordinate these. Persistence means
 the daemon must be shut down explicitly or by staleness — orphan management moves into the daemon.
+
+## 12. 6d implementation plan — upstream `rush daemon` (in-process)
+
+The end state: one long-lived process that **holds the repo lock once** and runs both the watch and
+`install`/`update`/`check`/`add` **in-process** via the manager classes — no child `rush start`, no
+lock juggling, and daemon-*mediated* mutating that coordinates with the watch. This is a rush-lib
+*core* change and needs maintainer (pgonzal) buy-in; deliver it as its own PR(s), not bolted onto the
+MCP server.
+
+### Verified seams (symbols confirmed to exist)
+- **install/update:** `doBasicInstallAsync(...)` (`libraries/rush-lib/src/logic/installManager/doBasicInstallAsync.ts`)
+  wraps `InstallManagerFactory.getInstallManagerAsync()` → `BaseInstallManager.doInstallAsync()`.
+- **add/remove:** `PackageJsonUpdater.doRushUpdateAsync(options)` (`logic/PackageJsonUpdater.ts:252`).
+- **check:** `VersionMismatchFinder.rushCheck(rushConfiguration, terminal, options)` (static, lock-free;
+  `logic/versionMismatch/VersionMismatchFinder.ts:69`).
+- **The lock is at the ACTION layer, not the managers:** `LockFile.tryAcquire(commonTempFolder, 'rush')`
+  in `cli/actions/BaseRushAction.ts:68`. A process holding it once can call the managers above directly
+  with no re-lock. ← the load-bearing fact for 6d.
+- **Watch already wants to be long-lived:** `cli/scriptActions/PhasedScriptAction.ts:885` —
+  `// Revisit when migrating to @rushstack/operation-graph and we have a long-lived operation graph`.
+- **Observability reuse:** rush-serve attaches via `rushSession.hooks.runPhasedCommand.for(name).tapPromise`
+  (`pluginFramework/RushLifeCycle.ts:101`), so an in-process phased command can keep the existing WS
+  protocol (and our MCP client) unchanged.
+
+### Sub-increments (each independently shippable + testable)
+- **6d-1 — extract `PhasedCommandRunner` from `PhasedScriptAction`** (pure refactor, no behavior change).
+  Lift `_runInitialPhasesAsync` / `_runWatchPhasesAsync` / `_executeOperationsAsync` + ProjectWatcher
+  wiring into a reusable class not tied to the CLI action; `PhasedScriptAction` becomes a thin wrapper.
+  Expose `runInitialAsync()`, `runWatchLoopAsync(abortSignal)`, and `quiesceAsync()`/`resumeAsync()`
+  (pause ProjectWatcher + cancel in-flight ops + run the `shutdownAsync` hook to stop IPC workers — the
+  `x` keypress already does this) WITHOUT releasing the lock. *Test:* `rush start`/`rush build` behave
+  identically (regression). Land this first — it de-risks everything and is independently useful.
+- **6d-2 — add a `rush daemon` action** that holds the lock (BaseRushAction already holds it for the
+  process lifetime) and hosts the watch via `PhasedCommandRunner` with rush-serve attached. *Test:*
+  the MCP build tools work against `rush daemon` exactly as against `rush start`.
+- **6d-3 — control channel + in-process mutating.** Add a request/response control endpoint (unix
+  socket / named pipe, or extend rush-serve's WS command set with `run-command`). On a mutating
+  request: `quiesceAsync()` the watch → run `doBasicInstallAsync` / `doRushUpdateAsync` / `rushCheck`
+  in-process → `resumeAsync()` (re-snapshot inputs, restart workers). No lock release. *Test (the risky
+  one):* run install repeatedly in one long-lived process — see risks below.
+- **6d-4 — point the MCP at `rush daemon`.** Replace the `rush start` supervisor launch with
+  `rush daemon`; route mutating commands to its control channel instead of stopping the daemon. Keep
+  the discovery file (now also advertising the control endpoint).
+
+### Avoiding the one-shot CLI coupling
+Call the **manager layer**, never the action layer: `InstallAction`/`UpdateAction` etc. carry the
+one-shot semantics (the parser's `_reportErrorAndSetExitCode` calls `process.exit`; `_ensureEnvironment`
+mutates `process.env.PATH`; telemetry flushes on exit; install event hooks fire). The managers
+(`doBasicInstallAsync`, `doRushUpdateAsync`, `rushCheck`) don't lock, don't `process.exit`, and don't
+mutate global PATH — so they're safe to call repeatedly in a daemon. Set PATH once at daemon start;
+flush telemetry on daemon shutdown; decide per-command whether pre/post-install event hooks should run.
+
+### Real risks (validate in 6d-3 before committing)
+- **Long-lived-process assumptions:** Rush is built for one-command-per-process. Running install
+  repeatedly in a daemon may surface stale `require`/module-resolution caches (node_modules changed
+  underneath), cached config singletons, or accumulated listeners. Mitigation: after install, reset
+  module resolution and restart IPC workers (their resolved modules changed) — the same stop-the-world
+  reality as today, but in-process. This is the main thing to prove out empirically.
+- **Error isolation:** a failed install must not tear down the daemon — wrap each in-process command
+  in its own try/catch and surface the error over the control channel.
+- **PhasedScriptAction extraction is invasive** (central, large action) — keep 6d-1 a strict no-op
+  refactor with the existing watch tests as the guardrail.
+
+### Validation strategy
+6d-1: existing `rush start`/`rush build`/`--watch` regression suite. 6d-2: MCP tools vs `rush daemon`.
+6d-3: a harness that issues N installs + builds in one daemon process and asserts correctness +
+no leaks. 6d-4: the multi-agent + mutating flows from §8, now daemon-mediated.
