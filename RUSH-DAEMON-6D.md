@@ -17,7 +17,15 @@ load `logic/installManager/doBasicInstallAsync` from the repo's published Rush. 
 install/update/check must be a same-bundle call inside rush-lib — exactly how `InstallAction` already
 calls `doBasicInstallAsync`.
 
-## 6d-1 — extract `PhasedCommandRunner` from `PhasedScriptAction`
+## 6d-1 — extract `PhasedCommandRunner` from `PhasedScriptAction` ✅ DONE (validated)
+
+Done in commit `4121bc9a96`. `PhasedScriptAction` 1196 → ~480 lines; engine moved to
+`PhasedCommandRunner.ts`. Validated: rush-lib `heft test` 627/0 (== baseline); local `rush build` and
+`rush start --watch` (initial build, watch loop, detected-change rebuild build+test) behave
+identically. NOTE for the eventual PR: `@microsoft/rush-lib` is published, so it needs a `rush change`
+changelog entry (skipped here — interactive).
+
+### Original plan (kept for reference)
 `PhasedScriptAction.ts` (1196 lines) → split into the **CLI action** (keeps the ~20 CommandLineParameter
 fields + `runAsync` parameter parsing, build-cache/cobuild config, project selection, plugin
 application, and the build of `ICreateOperationsContext`/`executionManagerOptions`) and a reusable
