@@ -72,6 +72,8 @@
   },
   "sideEffects": [
     "lib-commonjs/start.js",
-    "lib-esm/start.js"
+    "lib-esm/start.js",
+    "lib-commonjs/daemon/start.js",
+    "lib-esm/daemon/start.js"
   ]
 }
