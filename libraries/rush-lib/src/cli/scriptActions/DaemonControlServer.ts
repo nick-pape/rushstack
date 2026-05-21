@@ -48,6 +48,8 @@ export interface IDaemonControlServerOptions {
 export class DaemonControlServer {
   private readonly _options: IDaemonControlServerOptions;
   private _server: net.Server | undefined;
+  // Serializes command execution so concurrent agents never run overlapping (e.g. mutating) commands.
+  private _commandQueue: Promise<void> = Promise.resolve();
 
   public constructor(options: IDaemonControlServerOptions) {
     this._options = options;
@@ -106,8 +108,17 @@ export class DaemonControlServer {
       return;
     }
 
+    // Queue the command so commands run one at a time, in arrival order.
+    const commandPromise: Promise<string> = this._commandQueue.then(() =>
+      this._runCommandAsync(request.command, request.args ?? [])
+    );
+    this._commandQueue = commandPromise.then(
+      () => undefined,
+      () => undefined
+    );
+
     try {
-      const text: string = await this._runCommandAsync(request.command, request.args ?? []);
+      const text: string = await commandPromise;
       this._reply(socket, { id: request.id, ok: true, text });
     } catch (error) {
       this._reply(socket, {
