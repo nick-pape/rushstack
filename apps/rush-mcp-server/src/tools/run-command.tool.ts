@@ -80,17 +80,11 @@ export class RushRunCommandTool extends BaseTool {
 
     let notice: string = '';
     if (MUTATING_COMMANDS.has(command)) {
-      if (this._client.isHostSpawnedByUs()) {
-        await this._client.stopSpawnedHostAsync();
+      const stopped: boolean = await this._client.stopDaemonAsync();
+      if (stopped) {
         notice =
-          'Stopped the build host this server started to free the repository lock; it will restart ' +
-          'on the next build-status query.\n\n';
-      } else if (this._client.isConnected()) {
-        return this._textResult(
-          `Cannot run "rush ${command}" while a build host this server did not start is running ` +
-            `(it holds the repository lock). Stop that watch first, then retry.`,
-          true
-        );
+          'Stopped the shared build host daemon to free the repository lock; it will restart on the ' +
+          'next build-status query.\n\n';
       }
     }
 

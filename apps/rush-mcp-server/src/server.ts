@@ -15,7 +15,8 @@ import {
   RushRebuildTool,
   RushSetWatchStateTool,
   RushAbortBuildTool,
-  RushRunCommandTool
+  RushRunCommandTool,
+  RushShutdownHostTool
 } from './tools';
 import { RushMcpPluginLoader } from './pluginFramework/RushMcpPluginLoader';
 import { RushServeClient, getBuildHostConfigFromEnv } from './buildHost/RushServeClient';
@@ -56,6 +57,7 @@ export class RushMCPServer extends McpServer {
     this._tools.push(new RushSetWatchStateTool(this._buildHostClient));
     this._tools.push(new RushAbortBuildTool(this._buildHostClient));
     this._tools.push(new RushRunCommandTool(this._buildHostClient));
+    this._tools.push(new RushShutdownHostTool(this._buildHostClient));
   }
 
   private _registerTools(): void {

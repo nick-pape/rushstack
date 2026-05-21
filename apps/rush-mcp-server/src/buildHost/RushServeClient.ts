@@ -4,10 +4,12 @@
 import * as https from 'node:https';
 import type { ClientRequest, IncomingMessage } from 'node:http';
 import { spawn, type ChildProcess } from 'node:child_process';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 
 import { WebSocket, type RawData } from 'ws';
 
-import { Executable, SubprocessTerminator } from '@rushstack/node-core-library';
+import { LockFile } from '@rushstack/node-core-library';
 
 import type {
   IOperationInfo,
@@ -16,22 +18,26 @@ import type {
   IWebSocketEventMessage,
   ReadableOperationStatus
 } from './protocol.types';
+import { clearDiscovery, isProcessAlive, readDiscovery } from '../daemon/discoveryFile';
 
 /**
  * The default WebSocket URL for the build status server. Override with the
- * `RUSHMCP_BUILD_STATUS_WS_URL` environment variable to match the `buildStatusWebSocketPath`
- * and port configured for `@rushstack/rush-serve-plugin`.
+ * `RUSHMCP_BUILD_STATUS_WS_URL` environment variable to attach to a specific (e.g. externally started)
+ * build host. When unset, the client discovers/starts the shared daemon.
  */
 const DEFAULT_WEB_SOCKET_URL: string = 'wss://localhost:8443/';
 
-/** Default command used to start a build host when none is reachable. */
+/** Default command the daemon uses to start the watch. */
 const DEFAULT_START_COMMAND: string = 'rush start';
 
 const CONNECT_TIMEOUT_MS: number = 15000;
 const DEFAULT_START_TIMEOUT_MS: number = 180000;
+const DISCOVERY_POLL_MS: number = 250;
+const STOP_TIMEOUT_MS: number = 10000;
 
-/** Matches the `https://<host>:<port>/` line that rush-serve logs once it begins serving. */
-const SERVE_URL_REGEX: RegExp = /https:\/\/([a-zA-Z0-9.-]+):(\d+)\//;
+function delayAsync(milliseconds: number): Promise<void> {
+  return new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
+}
 
 /**
  * A point-in-time view of the build host's state.
@@ -46,15 +52,15 @@ export interface IBuildStatusSnapshot {
 export interface IRushServeClientOptions {
   /** The full WebSocket URL of the build status server, e.g. `wss://localhost:8443/`. */
   webSocketUrl: string;
-  /** If true, start a build host (`rush start`) when none is reachable. Default true. */
+  /** If true, start the shared daemon when no host is reachable. Default true. */
   autoStart: boolean;
-  /** The executable to start a build host with, e.g. `rush`. */
+  /** The executable the daemon uses to start the watch, e.g. `rush`. */
   startCommand: string;
   /** The arguments for the start command, e.g. `["start"]`. */
   startArgs: string[];
-  /** The working directory in which to start the build host (the Rush workspace root). */
+  /** The Rush workspace root. */
   workspacePath: string;
-  /** How long to wait for a spawned build host to begin serving before giving up. */
+  /** How long to wait for a starting daemon to begin serving before giving up. */
   startTimeoutMs: number;
 }
 
@@ -89,9 +95,10 @@ function toHttpsOrigin(wsUrl: string): string {
 }
 
 /**
- * A client that connects to the live build status WebSocket served by `@rushstack/rush-serve-plugin`.
- * If no host is reachable and `autoStart` is enabled, it starts one (`rush start`), discovers the
- * port it serves on, and connects. The connection is established lazily on first use.
+ * A client for the shared Rush build host. It connects to the watch served by the `BuildHostDaemon`
+ * (`@rushstack/rush-serve-plugin` under the hood), discovering it via `common/temp/rushmcp-build-host.json`
+ * and starting the daemon if none is running. The daemon (not this client) owns the watch, so the watch
+ * is shared across MCP clients and survives them. Connection is established lazily on first use.
  */
 export class RushServeClient {
   private readonly _configuredWebSocketUrl: string;
@@ -100,15 +107,13 @@ export class RushServeClient {
   private readonly _startArgs: string[];
   private readonly _workspacePath: string;
   private readonly _startTimeoutMs: number;
-  // The serve plugin uses a self-signed debug certificate. For localhost dev tooling we skip
-  // verification.
+  // The serve plugin uses a self-signed debug certificate. For localhost dev tooling we skip verification.
   // TODO (hardening): trust the CA via @rushstack/debug-certificate-manager instead of disabling it.
   private readonly _httpsAgent: https.Agent;
 
   private _httpsOrigin: string;
   private _webSocket: WebSocket | undefined;
   private _readyPromise: Promise<void> | undefined;
-  private _spawnedChild: ChildProcess | undefined;
 
   private _overallStatus: ReadableOperationStatus;
   private _sessionInfo: IRushSessionInfo | undefined;
@@ -134,8 +139,8 @@ export class RushServeClient {
   }
 
   /**
-   * Ensures the client is connected and has received an initial snapshot. If no host is reachable and
-   * autostart is enabled, starts one first. Safe to call repeatedly.
+   * Ensures the client is connected and has received an initial snapshot, discovering or starting the
+   * shared daemon as needed. Safe to call repeatedly.
    */
   public async ensureReadyAsync(): Promise<void> {
     if (this._webSocket && this._webSocket.readyState === WebSocket.OPEN) {
@@ -164,6 +169,11 @@ export class RushServeClient {
     };
   }
 
+  /** True if currently connected to a build host. */
+  public isConnected(): boolean {
+    return !!this._webSocket && this._webSocket.readyState === WebSocket.OPEN;
+  }
+
   /**
    * Returns the operations in the current snapshot that match the given project and/or phase.
    */
@@ -188,6 +198,62 @@ export class RushServeClient {
       throw new Error('Not connected to the Rush build host.');
     }
     this._webSocket.send(JSON.stringify(message));
+  }
+
+  /**
+   * Stops the shared build host daemon (if one is running), releasing the repository lock. Returns true
+   * if a daemon was stopped. The daemon restarts automatically the next time the host is needed.
+   */
+  public async stopDaemonAsync(): Promise<boolean> {
+    const webSocket: WebSocket | undefined = this._webSocket;
+    this._webSocket = undefined;
+    this._readyPromise = undefined;
+    if (webSocket) {
+      try {
+        webSocket.close();
+      } catch {
+        // ignore
+      }
+    }
+
+    const info: ReturnType<typeof readDiscovery> = readDiscovery(this._workspacePath);
+    if (!info) {
+      return false;
+    }
+
+    const { daemonPid } = info;
+    try {
+      process.kill(daemonPid, 'SIGTERM');
+    } catch {
+      // Already gone.
+    }
+
+    const deadline: number = Date.now() + STOP_TIMEOUT_MS;
+    while (Date.now() < deadline && isProcessAlive(daemonPid)) {
+      await delayAsync(DISCOVERY_POLL_MS);
+    }
+    if (isProcessAlive(daemonPid)) {
+      try {
+        process.kill(daemonPid, 'SIGKILL');
+      } catch {
+        // ignore
+      }
+    }
+    // The daemon clears the discovery file on exit; clear defensively in case it was force-killed.
+    try {
+      clearDiscovery(this._workspacePath);
+    } catch {
+      // ignore
+    }
+    return true;
+  }
+
+  /**
+   * No-op: the shared daemon is intentionally NOT stopped when a client disposes, so it survives for
+   * other clients. Use {@link stopDaemonAsync} (or the shutdown tool) to stop it explicitly.
+   */
+  public disposeAsync(): void {
+    // Intentionally empty.
   }
 
   /**
@@ -229,70 +295,40 @@ export class RushServeClient {
     });
   }
 
-  /**
-   * Terminates a build host that this client started (if any). No-op if the host was not started by us.
-   */
-  public disposeAsync(): void {
-    this._killSpawnedHost();
-  }
-
-  /** True if this client started the build host (so it is safe for us to stop it). */
-  public isHostSpawnedByUs(): boolean {
-    return !!this._spawnedChild && this._spawnedChild.exitCode === null;
-  }
-
-  /** True if currently connected to a build host. */
-  public isConnected(): boolean {
-    return !!this._webSocket && this._webSocket.readyState === WebSocket.OPEN;
-  }
-
-  /**
-   * Stops the build host this client started (releasing the repository lock) and resets the connection
-   * so the next `ensureReadyAsync()` re-establishes it. No-op if we did not start one. Resolves once the
-   * host process has actually exited.
-   */
-  public async stopSpawnedHostAsync(): Promise<void> {
-    const child: ChildProcess | undefined = this._spawnedChild;
-    const webSocket: WebSocket | undefined = this._webSocket;
-    this._webSocket = undefined;
-    this._readyPromise = undefined;
-    if (webSocket) {
-      try {
-        webSocket.close();
-      } catch {
-        // ignore
-      }
-    }
-    if (!child || child.exitCode !== null) {
-      this._spawnedChild = undefined;
-      return;
-    }
-    const exited: Promise<void> = new Promise<void>((resolve) => {
-      child.once('exit', () => resolve());
-    });
-    this._killSpawnedHost();
-    await exited;
-    this._spawnedChild = undefined;
-  }
-
   private async _establishConnectionAsync(): Promise<void> {
-    // 1. Try to connect to an already-running host.
+    // 1. Try the configured URL (an explicitly-specified or externally-started host).
     try {
       await this._connectToUrlAsync(this._configuredWebSocketUrl);
       return;
-    } catch (initialError) {
-      if (!this._autoStart) {
-        throw new Error(
-          `Could not connect to the Rush build host at ${this._configuredWebSocketUrl}: ` +
-            `${(initialError as Error).message}\n` +
-            `Start one with "${this._startCommand} ${this._startArgs.join(' ')}" (with ` +
-            `@rushstack/rush-serve-plugin enabled), or enable autostart (RUSHMCP_BUILD_AUTOSTART=1).`
-        );
+    } catch {
+      // fall through
+    }
+
+    // 2. Try a daemon advertised in the discovery file.
+    const existing: ReturnType<typeof readDiscovery> = readDiscovery(this._workspacePath);
+    if (existing) {
+      try {
+        await this._connectToUrlAsync(existing.webSocketUrl);
+        return;
+      } catch {
+        // The discovery file is stale or the host is unreachable; remove it and start fresh.
+        try {
+          clearDiscovery(this._workspacePath);
+        } catch {
+          // ignore
+        }
       }
     }
 
-    // 2. Nothing reachable: start a host and connect to it.
-    const startedUrl: string = await this._spawnHostAndGetUrlAsync();
+    // 3. Start the shared daemon and connect to it.
+    if (!this._autoStart) {
+      throw new Error(
+        `Could not connect to a Rush build host (configured URL ${this._configuredWebSocketUrl} and no ` +
+          `running daemon). Start one with "${this._startCommand} ${this._startArgs.join(' ')}" + ` +
+          `@rushstack/rush-serve-plugin, or enable autostart (RUSHMCP_BUILD_AUTOSTART=1).`
+      );
+    }
+    const startedUrl: string = await this._startDaemonAndGetUrlAsync();
     await this._connectToUrlAsync(startedUrl);
   }
 
@@ -318,13 +354,11 @@ export class RushServeClient {
         }
         this._handleMessage(message);
 
-        // The first message after connecting is a 'sync', which means our snapshot is now populated.
         if (!settled && message.event === 'sync') {
           settled = true;
           clearTimeout(timeout);
           this._webSocket = webSocket;
           this._httpsOrigin = toHttpsOrigin(url);
-          // Reconnect on a future close.
           webSocket.on('close', () => {
             this._webSocket = undefined;
             this._readyPromise = undefined;
@@ -352,98 +386,54 @@ export class RushServeClient {
   }
 
   /**
-   * Starts a build host and resolves with the WebSocket URL it serves on (discovered by scraping the
-   * serve URL it prints to stdout).
+   * Starts the shared build host daemon (detached, so it outlives this process) and resolves with the
+   * WebSocket URL it advertises once it begins serving. Serialized with a lock so concurrent clients
+   * do not each start a daemon.
    */
-  private async _spawnHostAndGetUrlAsync(): Promise<string> {
-    const resolvedCommand: string | undefined = Executable.tryResolve(this._startCommand);
-    if (!resolvedCommand) {
-      throw new Error(`Cannot start a build host: command "${this._startCommand}" was not found on PATH.`);
-    }
-
-    // Strip our own config vars from the child's environment so they can't confuse Rush. (Rush also
-    // rejects any unrecognized variable that starts with the reserved "RUSH_" prefix, which is why
-    // these are named "RUSHMCP_" rather than "RUSH_".)
-    const childEnv: NodeJS.ProcessEnv = { ...process.env };
-    for (const key of Object.keys(childEnv)) {
-      if (key.startsWith('RUSHMCP_')) {
-        delete childEnv[key];
+  private async _startDaemonAndGetUrlAsync(): Promise<string> {
+    const commonTempFolder: string = path.join(this._workspacePath, 'common', 'temp');
+    const launchLock: LockFile = await LockFile.acquireAsync(commonTempFolder, 'rushmcp-daemon-launch');
+    try {
+      // Another client may have started the daemon while we waited for the lock.
+      const existing: ReturnType<typeof readDiscovery> = readDiscovery(this._workspacePath);
+      if (existing) {
+        return existing.webSocketUrl;
       }
-    }
 
-    const child: ChildProcess = spawn(resolvedCommand, this._startArgs, {
-      cwd: this._workspacePath,
-      // detached (on POSIX) lets SubprocessTerminator terminate the whole process tree.
-      ...SubprocessTerminator.RECOMMENDED_OPTIONS,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: childEnv
-    });
-    this._spawnedChild = child;
-    // Terminate the host (and its descendants) if this process exits or is signalled.
-    SubprocessTerminator.killProcessTreeOnExit(child, SubprocessTerminator.RECOMMENDED_OPTIONS);
+      const daemonScript: string = path.resolve(__dirname, '..', 'daemon', 'start.js');
+      const logPath: string = path.join(commonTempFolder, 'rushmcp-build-host.log');
+      const logFd: number = fs.openSync(logPath, 'a');
+      let child: ChildProcess;
+      try {
+        child = spawn(process.execPath, [daemonScript, this._workspacePath], {
+          cwd: this._workspacePath,
+          // Detached + unref so the daemon outlives this client (the daemon owns the watch).
+          detached: true,
+          stdio: ['ignore', logFd, logFd],
+          env: process.env
+        });
+      } finally {
+        fs.closeSync(logFd);
+      }
+      child.unref();
 
-    // The path of the WebSocket endpoint comes from the configured URL; the host:port is discovered.
-    const webSocketPath: string = new URL(this._configuredWebSocketUrl).pathname;
-
-    return await new Promise<string>((resolve, reject) => {
-      let settled: boolean = false;
-      let buffer: string = '';
-
-      const timeout: NodeJS.Timeout = setTimeout(() => {
-        if (!settled) {
-          settled = true;
-          this._killSpawnedHost();
-          reject(
-            new Error(
-              `Timed out after ${this._startTimeoutMs}ms waiting for "${this._startCommand} ` +
-                `${this._startArgs.join(' ')}" to begin serving.`
-            )
+      const deadline: number = Date.now() + this._startTimeoutMs;
+      while (Date.now() < deadline) {
+        const info: ReturnType<typeof readDiscovery> = readDiscovery(this._workspacePath);
+        if (info) {
+          return info.webSocketUrl;
+        }
+        if (child.exitCode !== null) {
+          throw new Error(
+            `The build host daemon exited (code ${child.exitCode}) before serving. See ${logPath}.`
           );
         }
-      }, this._startTimeoutMs);
-
-      const onData = (chunk: Buffer): void => {
-        // Keep consuming output even after we've found the URL so the child's pipe never blocks.
-        if (settled) {
-          return;
-        }
-        buffer += chunk.toString();
-        const match: RegExpMatchArray | null = buffer.match(SERVE_URL_REGEX);
-        if (match) {
-          settled = true;
-          clearTimeout(timeout);
-          resolve(`wss://${match[1]}:${match[2]}${webSocketPath}`);
-        }
-      };
-
-      child.stdout?.on('data', onData);
-      child.stderr?.on('data', onData);
-
-      child.on('error', (error: Error) => {
-        if (!settled) {
-          settled = true;
-          clearTimeout(timeout);
-          reject(new Error(`Failed to start build host: ${error.message}`));
-        }
-      });
-
-      child.on('exit', (code: number | null) => {
-        if (!settled) {
-          settled = true;
-          clearTimeout(timeout);
-          reject(new Error(`Build host exited (code ${code}) before it began serving.`));
-        }
-      });
-    });
-  }
-
-  private _killSpawnedHost(): void {
-    const child: ChildProcess | undefined = this._spawnedChild;
-    if (!child) {
-      return;
+        await delayAsync(DISCOVERY_POLL_MS);
+      }
+      throw new Error(`Timed out waiting for the build host daemon to start. See ${logPath}.`);
+    } finally {
+      launchLock.release();
     }
-    // Terminates the entire process tree (SIGKILL of the group on POSIX, TaskKill /T on Windows).
-    SubprocessTerminator.killProcessTree(child, SubprocessTerminator.RECOMMENDED_OPTIONS);
   }
 
   private _handleMessage(message: IWebSocketEventMessage): void {

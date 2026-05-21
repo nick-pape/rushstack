@@ -13,3 +13,4 @@ export { RushRebuildTool } from './build-rebuild.tool';
 export { RushSetWatchStateTool } from './build-watch-state.tool';
 export { RushAbortBuildTool } from './build-abort.tool';
 export { RushRunCommandTool } from './run-command.tool';
+export { RushShutdownHostTool } from './build-shutdown.tool';
