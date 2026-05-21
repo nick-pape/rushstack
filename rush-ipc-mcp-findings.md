@@ -135,8 +135,9 @@ noreply email during the first push — see Validation log).
 - `apps/rush-mcp-server/src/buildHost/RushServeClient.ts` — lazy wss client, in-memory snapshot,
   `findOperations`, `sendCommandAsync`, https log fetch (`undefined` on 404), and **spawn-or-connect**:
   tries the configured URL, and if unreachable + autostart, spawns the start command, scrapes the
-  ephemeral port from its stdout, and connects. Spawns detached and kills the process group on
-  dispose/exit. TLS via `rejectUnauthorized:false` (TODO: trust the debug CA).
+  ephemeral port from its stdout, and connects. The host is terminated via `SubprocessTerminator`
+  (whole-tree kill) on dispose and on process exit/SIGINT/SIGTERM. TLS via `rejectUnauthorized:false`
+  (TODO: trust the debug CA).
   Env config (all **`RUSHMCP_`**-prefixed — NOT `RUSH_`, see gotcha below):
   `RUSHMCP_BUILD_STATUS_WS_URL` (default `wss://localhost:8443/`), `RUSHMCP_BUILD_AUTOSTART`
   (default on), `RUSHMCP_BUILD_START_COMMAND` (default `rush start`), `RUSHMCP_BUILD_START_TIMEOUT_MS`.
@@ -184,14 +185,15 @@ noreply email during the first push — see Validation log).
   Rush" → exit 1). Our config vars were originally `RUSH_BUILD_*`; renamed to `RUSHMCP_*`, and the
   spawn also strips `RUSHMCP_*` from the child env. (Don't squat on Rush's namespace — also an
   upstream-review concern.)
-- **Reaping limitation:** spawn-detached + kill-process-group works when our cleanup runs. The sandbox
-  `install-run-rush.js` shim spawns the *real* rush in its own group, so if the parent dies abruptly
-  (e.g. SIGKILL, or a `| head` EPIPE during testing) the real rush is orphaned (reparented to init)
-  and keeps the repo lock → next `rush start` fails with "Another Rush command is already running."
-  In production the global `rush` launcher runs in-process (single tree), so this is mostly a sandbox
-  artifact; for robustness consider `SubprocessTerminator` from `@rushstack/node-core-library`.
-  Cleanup during testing: `pkill -f 'install-run/@microsoft\+rush.*rush start'` and
-  `rm -f common/temp/rush#*.lock`.
+- **Reaping (hardened):** the client now terminates the spawned host with `SubprocessTerminator`
+  (`@rushstack/node-core-library`): spawn with `RECOMMENDED_OPTIONS` (detached on POSIX),
+  `killProcessTreeOnExit` to reap on our exit/SIGINT/SIGTERM, and `killProcessTree` (SIGKILL of the
+  group on POSIX, `TaskKill /T` on Windows) on dispose. Verified: after dispose, no orphaned
+  `rush start` remains and the repo lock is released — even through the `install-run` shim tree.
+  (Caveat: if our process is `kill -9`'d, nothing can run cleanup; that's inherent.)
+  Stray-process cleanup during testing, BY PID (do NOT `pkill -f` patterns that also match your own
+  shell — that kills the build): `for p in $(ps -eo pid,args | grep 'rush start' | grep -v grep |
+  awk '{print $1}'); do kill -9 $p; done` and `rm -f common/temp/rush#*.lock`.
 
 ## 9. Running the live test harness (repro)
 
@@ -218,6 +220,5 @@ Wired into THIS repo for validation (kept uncommitted — it's a harness, not th
 - Phase 6 (multi-agent sharing): a discovery file so a second MCP can find a watch the first one
   spawned (rush-serve uses an ephemeral port with no discovery today); likely add
   port + wsPath + logServePath + repoId + pid, upstream-able. Race-safe spawn (LockFile).
-- Reaping hardening: `SubprocessTerminator` instead of process-group kill (see §8).
 - TLS hardening: trust the debug CA instead of `rejectUnauthorized:false`.
 - Whether to commit the rush-serve test harness or document it as setup.
