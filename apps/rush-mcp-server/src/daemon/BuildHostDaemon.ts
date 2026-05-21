@@ -12,6 +12,15 @@ import { clearDiscovery, writeDiscovery } from './discoveryFile';
 /** Matches the `https://<host>:<port>/` line that rush-serve logs once it begins serving. */
 const SERVE_URL_REGEX: RegExp = /https:\/\/([a-zA-Z0-9.-]+):(\d+)\//;
 
+const RESTART_DELAY_MS: number = 1000;
+/** A watch that exits within this window of starting is treated as a crash for back-off purposes. */
+const FAST_FAILURE_WINDOW_MS: number = 5000;
+const MAX_CONSECUTIVE_FAILURES: number = 3;
+
+function delayAsync(milliseconds: number): Promise<void> {
+  return new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
+}
+
 export interface IBuildHostDaemonOptions {
   /** The Rush workspace root. */
   workspacePath: string;
@@ -50,7 +59,8 @@ export class BuildHostDaemon {
     }
 
     let child: ChildProcess | undefined;
-    // Clean up the discovery file no matter how we exit.
+
+    // Clean up the discovery file no matter how we exit (including process.exit on a signal).
     process.once('exit', () => {
       try {
         clearDiscovery(workspacePath);
@@ -58,25 +68,48 @@ export class BuildHostDaemon {
         // ignore
       }
     });
+    // On a signal, exit; the 'exit' handler clears discovery and SubprocessTerminator reaps the watch.
     process.once('SIGINT', () => process.exit(0));
     process.once('SIGTERM', () => process.exit(0));
 
     try {
-      child = this._spawnWatch();
-      // Reap the watch tree when this daemon exits or is signalled.
-      SubprocessTerminator.killProcessTreeOnExit(child, SubprocessTerminator.RECOMMENDED_OPTIONS);
+      // Supervision loop: keep the watch running, restarting it if it exits unexpectedly (each restart
+      // re-advertises the new port; connected clients reconnect via the discovery file). The loop ends
+      // only if the watch crash-loops; the counter is the loop condition.
+      let consecutiveFailures: number = 0;
+      while (consecutiveFailures < MAX_CONSECUTIVE_FAILURES) {
+        const startedAt: number = Date.now();
+        child = this._spawnWatch();
+        // Reap the watch tree if this daemon exits or is signalled.
+        SubprocessTerminator.killProcessTreeOnExit(child, SubprocessTerminator.RECOMMENDED_OPTIONS);
 
-      const webSocketUrl: string = await this._discoverServeUrlAsync(child);
-      writeDiscovery(workspacePath, {
-        webSocketUrl,
-        daemonPid: process.pid,
-        startedAt: new Date().toISOString()
-      });
-      process.stdout.write(`Build host ready at ${webSocketUrl} (daemon pid ${process.pid}).\n`);
+        let webSocketUrl: string;
+        try {
+          webSocketUrl = await this._discoverServeUrlAsync(child);
+        } catch (error) {
+          consecutiveFailures++;
+          process.stderr.write(`Watch failed to start: ${(error as Error).message}\n`);
+          await delayAsync(RESTART_DELAY_MS);
+          continue;
+        }
 
-      // Stay alive until the watch exits (a signal triggers process.exit above, which kills the watch).
-      await once(child, 'exit');
-      process.stdout.write('Watch process exited; shutting down daemon.\n');
+        writeDiscovery(workspacePath, {
+          webSocketUrl,
+          daemonPid: process.pid,
+          startedAt: new Date().toISOString()
+        });
+        process.stdout.write(`Build host ready at ${webSocketUrl} (daemon pid ${process.pid}).\n`);
+
+        await once(child, 'exit');
+
+        // The watch exited on its own. Drop the advertisement and restart unless it's crash-looping
+        // (a watch that ran long enough before exiting resets the failure counter).
+        clearDiscovery(workspacePath);
+        consecutiveFailures = Date.now() - startedAt < FAST_FAILURE_WINDOW_MS ? consecutiveFailures + 1 : 0;
+        process.stderr.write('Watch exited; restarting...\n');
+        await delayAsync(RESTART_DELAY_MS);
+      }
+      process.stderr.write(`Watch crash-looped; giving up after ${MAX_CONSECUTIVE_FAILURES} failures.\n`);
     } finally {
       clearDiscovery(workspacePath);
       if (child) {
