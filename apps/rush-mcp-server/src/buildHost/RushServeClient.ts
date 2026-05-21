@@ -7,7 +7,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 
 import { WebSocket, type RawData } from 'ws';
 
-import { Executable } from '@rushstack/node-core-library';
+import { Executable, SubprocessTerminator } from '@rushstack/node-core-library';
 
 import type {
   IOperationInfo,
@@ -109,7 +109,6 @@ export class RushServeClient {
   private _webSocket: WebSocket | undefined;
   private _readyPromise: Promise<void> | undefined;
   private _spawnedChild: ChildProcess | undefined;
-  private _cleanupRegistered: boolean;
 
   private _overallStatus: ReadableOperationStatus;
   private _sessionInfo: IRushSessionInfo | undefined;
@@ -126,7 +125,6 @@ export class RushServeClient {
     this._httpsOrigin = toHttpsOrigin(this._configuredWebSocketUrl);
     this._httpsAgent = new https.Agent({ rejectUnauthorized: false });
 
-    this._cleanupRegistered = false;
     this._overallStatus = 'Ready';
     this._operationsByName = new Map();
   }
@@ -336,13 +334,14 @@ export class RushServeClient {
 
     const child: ChildProcess = spawn(resolvedCommand, this._startArgs, {
       cwd: this._workspacePath,
-      // Run in its own process group so we can terminate the whole tree later.
-      detached: true,
+      // detached (on POSIX) lets SubprocessTerminator terminate the whole process tree.
+      ...SubprocessTerminator.RECOMMENDED_OPTIONS,
       stdio: ['ignore', 'pipe', 'pipe'],
       env: childEnv
     });
     this._spawnedChild = child;
-    this._registerHostCleanup();
+    // Terminate the host (and its descendants) if this process exits or is signalled.
+    SubprocessTerminator.killProcessTreeOnExit(child, SubprocessTerminator.RECOMMENDED_OPTIONS);
 
     // The path of the WebSocket endpoint comes from the configured URL; the host:port is discovered.
     const webSocketPath: string = new URL(this._configuredWebSocketUrl).pathname;
@@ -399,31 +398,13 @@ export class RushServeClient {
     });
   }
 
-  private _registerHostCleanup(): void {
-    if (this._cleanupRegistered) {
-      return;
-    }
-    this._cleanupRegistered = true;
-    process.once('exit', () => this._killSpawnedHost());
-    for (const signal of ['SIGINT', 'SIGTERM'] as const) {
-      process.once(signal, () => {
-        this._killSpawnedHost();
-        process.exit(signal === 'SIGINT' ? 130 : 143);
-      });
-    }
-  }
-
   private _killSpawnedHost(): void {
     const child: ChildProcess | undefined = this._spawnedChild;
-    if (!child || child.exitCode !== null || child.pid === undefined) {
+    if (!child) {
       return;
     }
-    try {
-      // Negative pid targets the whole process group (the host was started detached).
-      process.kill(-child.pid, 'SIGTERM');
-    } catch {
-      // Best effort; ignore (the process may have already exited).
-    }
+    // Terminates the entire process tree (SIGKILL of the group on POSIX, TaskKill /T on Windows).
+    SubprocessTerminator.killProcessTree(child, SubprocessTerminator.RECOMMENDED_OPTIONS);
   }
 
   private _handleMessage(message: IWebSocketEventMessage): void {
