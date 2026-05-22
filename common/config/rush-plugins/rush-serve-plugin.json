@@ -1,0 +1,5 @@
+{
+  "phasedCommands": ["start"],
+  "buildStatusWebSocketPath": "/",
+  "logServePath": "/log"
+}

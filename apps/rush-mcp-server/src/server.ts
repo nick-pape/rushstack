@@ -9,14 +9,23 @@ import {
   RushMigrateProjectTool,
   RushCommandValidatorTool,
   RushWorkspaceDetailsTool,
-  RushProjectDetailsTool
+  RushProjectDetailsTool,
+  RushBuildStatusTool,
+  RushBuildLogsTool,
+  RushRebuildTool,
+  RushSetWatchStateTool,
+  RushAbortBuildTool,
+  RushRunCommandTool,
+  RushShutdownHostTool
 } from './tools';
 import { RushMcpPluginLoader } from './pluginFramework/RushMcpPluginLoader';
+import { RushServeClient, getBuildHostConfigFromEnv } from './buildHost/RushServeClient';
 
 export class RushMCPServer extends McpServer {
   private _rushWorkspacePath: string;
   private _tools: BaseTool[] = [];
   private _pluginLoader: RushMcpPluginLoader;
+  private _buildHostClient: RushServeClient;
 
   public constructor(rushWorkspacePath: string) {
     super({
@@ -26,6 +35,7 @@ export class RushMCPServer extends McpServer {
 
     this._rushWorkspacePath = rushWorkspacePath;
     this._pluginLoader = new RushMcpPluginLoader(this._rushWorkspacePath, this);
+    this._buildHostClient = new RushServeClient(getBuildHostConfigFromEnv(this._rushWorkspacePath));
   }
 
   public async startAsync(): Promise<void> {
@@ -41,6 +51,13 @@ export class RushMCPServer extends McpServer {
     this._tools.push(new RushCommandValidatorTool());
     this._tools.push(new RushWorkspaceDetailsTool());
     this._tools.push(new RushProjectDetailsTool());
+    this._tools.push(new RushBuildStatusTool(this._buildHostClient));
+    this._tools.push(new RushBuildLogsTool(this._buildHostClient));
+    this._tools.push(new RushRebuildTool(this._buildHostClient));
+    this._tools.push(new RushSetWatchStateTool(this._buildHostClient));
+    this._tools.push(new RushAbortBuildTool(this._buildHostClient));
+    this._tools.push(new RushRunCommandTool(this._buildHostClient));
+    this._tools.push(new RushShutdownHostTool(this._buildHostClient));
   }
 
   private _registerTools(): void {
